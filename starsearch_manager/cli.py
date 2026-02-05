@@ -15,14 +15,14 @@ def load_config():
 
 def get_server(config, target=None):
     """Get server configuration by name or return the default (first) server.
-    
+
     Args:
         config: Configuration dictionary containing 'servers' list
         target: Optional server name to look up
-        
+
     Returns:
         tuple: (server_dict, is_default_bool)
-        
+
     Raises:
         SystemExit: If target server is not found (prints available servers and exits)
     """
@@ -31,14 +31,14 @@ def get_server(config, target=None):
         for srv in servers:
             if srv["name"] == target:
                 return srv, False
-        
+
         # Target not found - show helpful error message
         print(f"Error: Server '{target}' not found in configuration", file=sys.stderr)
         print(f"\nAvailable servers:", file=sys.stderr)
         for srv in servers:
             print(f"  - {srv['name']}", file=sys.stderr)
         sys.exit(1)
-    
+
     return servers[0], True  # default server, is_default=True
 
 def get_auth(server):
@@ -58,7 +58,7 @@ def get_cluster_base_url(server):
     protocol = server['protocol']
     host = server['host']
     cluster_path = server.get('cluster_path', '')
-    
+
     if cluster_path:
         # Ensure cluster_path starts with / and doesn't end with /
         if not cluster_path.startswith('/'):
@@ -73,7 +73,7 @@ def get_base_url(server):
     protocol = server['protocol']
     host = server['host']
     base_path = server.get('base_path', '')
-    
+
     if base_path:
         # Ensure base_path starts with / and doesn't end with /
         if not base_path.startswith('/'):
@@ -94,20 +94,20 @@ def load_commands():
 
 def resolve_endpoint(args):
     commands = load_commands()
-    
+
     # Try command mapping: search <cmd> <subcmd> -> _<cmd>/<subcmd>
     if args[0] in commands:
         prefix = commands[args[0]]
         if len(args) > 1:
             return f"{prefix}/{'/'.join(args[1:])}"
         return prefix
-    
+
     # Fallback: treat as raw endpoint
     return " ".join(args)
 
 def handle_export_output(result, use_json, to_file, output_dir="."):
     """Handle export output: print to stdout or write to files.
-    
+
     Args:
         result: Export result string (ndjson format)
         use_json: Whether to format as JSON
@@ -117,11 +117,11 @@ def handle_export_output(result, use_json, to_file, output_dir="."):
     if isinstance(result, dict) and "error" in result:
         print(json.dumps(result, indent=2))
         return
-    
+
     if to_file:
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
-        
+
         lines = [json.loads(line) for line in result.strip().split('\n') if line.strip()]
         for line in lines:
             if '_index_pattern_map' in line:
@@ -145,22 +145,22 @@ def handle_saved_object_command(args, cfg, target, obj_type):
     """Generic handler for saved object commands (list/export/import/delete)."""
     if len(args) < 2:
         return False
-    
+
     subcommand = args[1]
-    
+
     if subcommand == "list":
         # Use appropriate list function based on type
         results = functions.list_dashboards(cfg, target, obj_type=obj_type)
-        
+
         if isinstance(results, dict) and "error" in results:
             print(json.dumps(results, indent=2))
         else:
             functions.print_saved_objects(results)
         return True
-    
+
     elif subcommand == "export":
         use_json = "--json" in args
-        
+
         # Extract --to-file and its optional path
         to_file = False
         output_dir = "."
@@ -184,12 +184,12 @@ def handle_saved_object_command(args, cfg, target, obj_type):
             else:
                 filtered_args.append(args[i])
                 i += 1
-        
+
         obj_ids = filtered_args if filtered_args else None
         result = functions.export_saved_objects(cfg, target, obj_ids, obj_type=obj_type)
         handle_export_output(result, use_json, to_file, output_dir)
         return True
-    
+
     elif subcommand == "import":
         if len(args) < 3:
             obj_name = obj_type or "saved-object"
@@ -201,7 +201,7 @@ def handle_saved_object_command(args, cfg, target, obj_type):
         result = functions.import_saved_objects(cfg, ndjson_content, target, obj_type=obj_type)
         print(json.dumps(result, indent=2))
         return True
-    
+
     elif subcommand == "delete":
         if obj_type is None:
             return False  # saved-object doesn't support delete
@@ -212,16 +212,16 @@ def handle_saved_object_command(args, cfg, target, obj_type):
         result = functions.delete_saved_object(cfg, obj_id, obj_type, target)
         print(json.dumps(result, indent=2))
         return True
-    
+
     return False
 
 def query(endpoint, target=None):
     cfg = load_config()
     server, is_default = get_server(cfg, target)
-    
+
     if is_default:
         print(f"→ {server['name']}")
-    
+
     base_url = get_cluster_base_url(server)
     url = f"{base_url}/{endpoint}"
     auth = get_auth(server)
@@ -236,7 +236,7 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1] in ["-v", "--version"]:
         print(f"starsearch-cli version {VERSION}")
         sys.exit(0)
-    
+
     if len(sys.argv) < 2 or sys.argv[1] in ["-h", "--help"]:
         print("Usage: starsearch-cli <command> [args] or starsearch-cli <endpoint>")
         print("       starsearch-cli -t|--target <name> <command> [args]")
@@ -262,6 +262,9 @@ def main():
         print("  starsearch-cli search export [id1 id2 ...] [--json]     - Export searches to ndjson")
         print("  starsearch-cli search import <file.ndjson>              - Import searches from ndjson")
         print("  starsearch-cli search delete <id>                       - Delete a search")
+        print("")
+        print("  starsearch-cli detector list                            - List all anomaly detection detectors")
+        print("  starsearch-cli detector export [id1 id2 ...] [--json] [--to-file [path]] - Export detectors to ndjson")
         print("\nOther Commands:")
         print("  starsearch-cli ilm info [--all]                         - Show ILM policy info for indices")
         print("  starsearch-cli ilm <policy> set delete-after <days>     - Set delete phase for a policy")
@@ -272,26 +275,26 @@ def main():
         print("  starsearch-cli index-pattern list                       - List all index patterns")
         print("  starsearch-cli index-pattern delete <pattern-id>        - Delete an index pattern")
         sys.exit(0 if len(sys.argv) > 1 else 1)
-    
+
     target = None
     args = sys.argv[1:]
-    
+
     if args[0] in ["-t", "--target"]:
         if len(args) < 3:
             print("Error: -t/--target requires a server name")
             sys.exit(1)
         target = args[1]
         args = args[2:]
-    
+
     cfg = load_config()
-    
+
     # Target commands
     if len(args) >= 2 and args[0] == "target" and args[1] == "list":
         servers = cfg.get("servers", [])
         if not servers:
             print("No targets configured in ~/.starsearch/config.json")
             return
-        
+
         print("\nConfigured targets:")
         print("="*80)
         for i, srv in enumerate(servers):
@@ -308,37 +311,80 @@ def main():
         print("\n" + "="*80)
         print(f"\nTotal: {len(servers)} target(s)")
         return
-    
+
     # Saved-object commands (type-agnostic)
     if len(args) >= 2 and args[0] == "saved-object":
         if handle_saved_object_command(args, cfg, target, obj_type=None):
             return
-    
+
     # Dashboard commands
     if len(args) >= 2 and args[0] == "dashboard":
         if handle_saved_object_command(args, cfg, target, obj_type="dashboard"):
             return
-    
+
     # Visualization commands
     if len(args) >= 2 and args[0] == "visualization":
         if handle_saved_object_command(args, cfg, target, obj_type="visualization"):
             return
-    
+
     # Search commands
     if len(args) >= 2 and args[0] == "search":
         if handle_saved_object_command(args, cfg, target, obj_type="search"):
             return
-    
+
+    # Detector commands
+    if len(args) >= 2 and args[0] == "detector":
+        subcommand = args[1]
+
+        if subcommand == "list":
+            results = functions.list_detectors(cfg, target)
+
+            if isinstance(results, dict) and "error" in results:
+                print(json.dumps(results, indent=2))
+            else:
+                functions.print_saved_objects(results)
+            return
+
+        elif subcommand == "export":
+            use_json = "--json" in args
+
+            # Extract --to-file and its optional path
+            to_file = False
+            output_dir = "."
+            filtered_args = []
+            i = 2
+            while i < len(args):
+                if args[i] == "--to-file":
+                    to_file = True
+                    # Check if next arg is a path
+                    if i + 1 < len(args) and not args[i + 1].startswith("--"):
+                        next_arg = args[i + 1]
+                        if '/' in next_arg or next_arg == '.':
+                            output_dir = next_arg
+                            i += 2
+                            continue
+                    i += 1
+                elif args[i] == "--json":
+                    i += 1
+                else:
+                    filtered_args.append(args[i])
+                    i += 1
+
+            detector_ids = filtered_args if filtered_args else None
+            result = functions.export_detectors(cfg, target, detector_ids)
+            handle_export_output(result, use_json, to_file, output_dir)
+            return
+
     # ILM commands
     if len(args) >= 2 and args[0] == "ilm" and args[1] == "info":
         show_all = "--all" in args or "--all" in sys.argv
         results = functions.get_index_lifecycle_info(cfg, target, show_all)
         functions.print_table(results)
         return
-    
+
     if len(args) >= 4 and args[0] == "ilm" and args[2] == "set":
         phase_arg = args[3] if len(args) > 3 else None
-        
+
         if phase_arg == "rollover":
             if len(args) < 6:
                 print("Usage: starsearch-cli ilm <policy> set rollover <max_size> <max_docs>")
@@ -351,7 +397,7 @@ def main():
             result = functions.set_policy_rollover(cfg, policy_name, max_size, max_docs, target)
             print(json.dumps(result, indent=2))
             return
-        
+
         if phase_arg not in ["delete-after", "warm-after", "cold-after"]:
             print("Error: phase must be delete-after, warm-after, cold-after, or rollover")
             sys.exit(1)
@@ -364,24 +410,24 @@ def main():
         except ValueError:
             print("Error: days must be an integer")
             sys.exit(1)
-        
+
         if phase_arg == "delete-after":
             result = functions.set_policy_delete_phase(cfg, policy_name, days, target)
         elif phase_arg == "warm-after":
             result = functions.set_policy_warm_phase(cfg, policy_name, days, target)
         elif phase_arg == "cold-after":
             result = functions.set_policy_cold_phase(cfg, policy_name, days, target)
-        
+
         print(json.dumps(result, indent=2))
         return
-    
+
     # Index commands
     if len(args) >= 3 and args[0] == "index" and args[1] == "delete":
         index_name = args[2]
         result = functions.delete_index(cfg, index_name, target)
         print(json.dumps(result, indent=2))
         return
-    
+
     # Index pattern commands
     if len(args) >= 2 and args[0] == "index-pattern":
         if args[1] == "list":
@@ -399,7 +445,7 @@ def main():
             result = functions.delete_index_pattern(cfg, pattern_id, target)
             print(json.dumps(result, indent=2))
             return
-    
+
     # Fallback to endpoint query
     endpoint = resolve_endpoint(args)
     query(endpoint, target)
