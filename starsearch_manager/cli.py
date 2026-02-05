@@ -266,7 +266,7 @@ def main():
         print("  starsearch-cli detector list                            - List all anomaly detection detectors")
         print("  starsearch-cli detector export [id1 id2 ...] [--json] [--to-file [path]] - Export detectors to ndjson")
         print("\nOther Commands:")
-        print("  starsearch-cli ilm info [--all]                         - Show ILM policy info for indices")
+        print("  starsearch-cli ilm list [--all]                         - Show ILM policy info for indices")
         print("  starsearch-cli ilm <policy> set delete-after <days>     - Set delete phase for a policy")
         print("  starsearch-cli ilm <policy> set warm-after <days>       - Set warm phase for a policy")
         print("  starsearch-cli ilm <policy> set cold-after <days>       - Set cold phase for a policy")
@@ -376,7 +376,7 @@ def main():
             return
 
     # ILM commands
-    if len(args) >= 2 and args[0] == "ilm" and args[1] == "info":
+    if len(args) >= 2 and args[0] == "ilm" and args[1] == "list":
         show_all = "--all" in args or "--all" in sys.argv
         results = functions.get_index_lifecycle_info(cfg, target, show_all)
         functions.print_table(results)
