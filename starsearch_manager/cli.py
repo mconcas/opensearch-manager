@@ -141,6 +141,58 @@ def handle_export_output(result, use_json, to_file, output_dir="."):
     else:
         print(result)
 
+def print_validation_results(result, verbose=False):
+    """Print dashboard validation results."""
+    if isinstance(result, dict) and "error" in result:
+        print(json.dumps(result, indent=2))
+        return
+
+    summary = result["summary"]
+    global_issues = result["global_issues"]
+    dashboards = result["dashboards"]
+
+    # Global issues
+    if global_issues:
+        print("\n\033[1mGlobal Issues\033[0m")
+        print("=" * 60)
+        for issue in global_issues:
+            icon = "\033[91m✗\033[0m" if issue["level"] == "error" else "\033[93m⚠\033[0m"
+            print(f"  {icon} {issue['message']}")
+
+    # Per-dashboard results
+    print(f"\n\033[1mDashboard Validation Results\033[0m")
+    print("=" * 60)
+
+    for d in dashboards:
+        if d["status"] == "ok":
+            icon = "\033[92m✓\033[0m"
+        elif d["status"] == "warning":
+            icon = "\033[93m⚠\033[0m"
+        else:
+            icon = "\033[91m✗\033[0m"
+
+        print(f"\n  {icon} {d['title']}  (id: {d['id']})")
+
+        if d["issues"]:
+            for issue in d["issues"]:
+                sub_icon = "\033[91m✗\033[0m" if issue["level"] == "error" else "\033[93m⚠\033[0m"
+                print(f"      {sub_icon} [{issue.get('check', 'unknown')}] {issue['message']}")
+        elif verbose:
+            print(f"      All checks passed")
+
+    # Summary
+    print(f"\n{'=' * 60}")
+    print(f"Total: {summary['total_dashboards']} dashboard(s) — "
+          f"\033[92m{summary['ok']} ok\033[0m, "
+          f"\033[93m{summary['warnings']} warning(s)\033[0m, "
+          f"\033[91m{summary['errors']} error(s)\033[0m, "
+          f"{summary['global_issues']} global issue(s)")
+
+    # Exit code hint
+    if summary["errors"] > 0 or summary["global_issues"] > 0:
+        return 1
+    return 0
+
 def handle_saved_object_command(args, cfg, target, obj_type):
     """Generic handler for saved object commands (list/export/import/delete)."""
     if len(args) < 2:
@@ -252,6 +304,7 @@ def main():
         print("  starsearch-cli dashboard export [id1 id2 ...] [--json]  - Export dashboards to ndjson")
         print("  starsearch-cli dashboard import <file.ndjson>           - Import dashboards from ndjson")
         print("  starsearch-cli dashboard delete <id>                    - Delete a dashboard")
+        print("  starsearch-cli dashboard validate [id ...] [--verbose] [--json] - Validate dashboards")
         print("")
         print("  starsearch-cli visualization list                       - List all visualizations")
         print("  starsearch-cli visualization export [id1 id2 ...] [--json] - Export visualizations to ndjson")
@@ -319,6 +372,19 @@ def main():
 
     # Dashboard commands
     if len(args) >= 2 and args[0] == "dashboard":
+        if args[1] == "validate":
+            verbose = "--verbose" in args or "-v" in args
+            use_json_flag = "--json" in args
+            # Collect dashboard IDs (everything that's not a flag)
+            d_ids = [a for a in args[2:] if not a.startswith("-")]
+            result = functions.validate_dashboards(cfg, target, d_ids or None, verbose=verbose)
+            if use_json_flag:
+                print(json.dumps(result, indent=2))
+            else:
+                exit_code = print_validation_results(result, verbose=verbose)
+                if exit_code:
+                    sys.exit(exit_code)
+            return
         if handle_saved_object_command(args, cfg, target, obj_type="dashboard"):
             return
 

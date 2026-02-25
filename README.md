@@ -1,4 +1,4 @@
-# *search Manager
+# *search manager
 
 Comprehensive CLI tool for managing Elasticsearch/OpenSearch clusters and OpenSearch Dashboards.
 
@@ -6,7 +6,8 @@ Comprehensive CLI tool for managing Elasticsearch/OpenSearch clusters and OpenSe
 
 - **Query Execution**: Run queries directly against Elasticsearch/OpenSearch clusters
 - **Saved Object Management**: Manage all saved objects (dashboards, visualizations, searches) collectively
-- **Dashboard Management**: List, export, import, and delete dashboards
+- **Dashboard Management**: List, export, import, delete, and **validate** dashboards
+- **Dashboard Validation**: Detect broken references, missing indices, missing fields, bad queries
 - **Visualization Management**: Manage visualizations independently
 - **Saved Search Management**: Manage saved searches
 - **Index Lifecycle Management**: Configure ILM/ISM policies
@@ -141,6 +142,63 @@ starsearch-cli dashboard import dashboards.ndjson
 
 # Delete a dashboard
 starsearch-cli dashboard delete dashboard-id
+```
+
+### Dashboard Validation
+
+Detect problems in dashboards before they break in the UI — broken references, missing indices, missing fields in aggregations, malformed queries:
+
+```bash
+# Validate all dashboards
+starsearch-cli dashboard validate
+
+# Validate specific dashboard(s) by ID
+starsearch-cli dashboard validate dash-id1 dash-id2
+
+# Verbose output (also shows passing dashboards)
+starsearch-cli dashboard validate --verbose
+
+# Machine-readable JSON output
+starsearch-cli dashboard validate --json
+
+# Validate on a specific target
+starsearch-cli --target prod dashboard validate
+```
+
+The validator walks the full dependency tree (dashboard → visualizations → saved searches → index patterns → cluster indices) and performs these checks:
+
+| Check | Level | Description |
+|---|---|---|
+| `broken-reference` | error | Dashboard references a visualization, search, or index pattern that doesn't exist |
+| `missing-index` | error | Index pattern doesn't resolve to any cluster index, alias, or data stream |
+| `missing-field` | error | Visualization aggregation or search column references a field not found in the index mapping (e.g., `message.keyword` when only `message` as `text` exists) |
+| `invalid-query` | warning | `searchSourceJSON` is malformed or has mismatched parentheses |
+| `invalid-json` | error | Dashboard's `panelsJSON` is not valid JSON |
+| `empty-dashboard` | warning | Dashboard has no panels or references |
+| Time field check | warning | Index pattern's configured time field not found in the actual index mapping |
+| Global index patterns | error | Any index pattern in the system has no matching indices |
+
+**Field-level validation** inspects `visState` aggregations, TSVB series, filters, and saved search columns against the actual cluster mapping (including `.keyword` sub-fields and nested properties). Data streams and their backing indices are fully supported.
+
+The command exits with code `1` when errors are found, making it suitable for CI pipelines.
+
+Example output:
+```
+Global Issues
+============================================================
+  ✗ Index pattern 'old-logs-*' (id: abc123) does not match any cluster index or alias
+
+Dashboard Validation Results
+============================================================
+
+  ✓ [Logs] Overview  (id: dash.logs.overview)
+
+  ✗ [InfluxDB] Overview  (id: dash.influxdb.overview)
+      ✗ [missing-field] Visualization '[InfluxDB] Messages' (id: vis.influxdb.messages) references
+        field 'message.keyword' not found in index 'p2-prod-metrics-app*' [agg "terms" (id: 2)]
+
+============================================================
+Total: 2 dashboard(s) — 1 ok, 0 warning(s), 1 error(s), 1 global issue(s)
 ```
 
 ### Visualization Management
