@@ -101,6 +101,19 @@ starsearch-cli saved-object export > all-objects.ndjson
 # Export specific objects by ID
 starsearch-cli saved-object export obj-id1 obj-id2 > objects.ndjson
 
+# Export only visualizations
+starsearch-cli saved-object export --type visualization > visualizations.ndjson
+
+# Export only dashboards
+starsearch-cli saved-object export --type dashboard > dashboards.ndjson
+
+# Export only saved searches
+starsearch-cli saved-object export --type search > searches.ndjson
+
+# Combine --type with other flags
+starsearch-cli saved-object export --type visualization --json > visualizations.json
+starsearch-cli saved-object export --type dashboard --to-file --json
+
 # Export as JSON array instead of NDJSON
 starsearch-cli saved-object export --json > objects.json
 

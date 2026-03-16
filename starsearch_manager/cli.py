@@ -216,6 +216,7 @@ def handle_saved_object_command(args, cfg, target, obj_type):
         # Extract --to-file and its optional path
         to_file = False
         output_dir = "."
+        type_filter = obj_type  # inherit from caller (e.g. "dashboard"), may be overridden by --type
         filtered_args = []
         i = 2
         while i < len(args):
@@ -231,6 +232,17 @@ def handle_saved_object_command(args, cfg, target, obj_type):
                         i += 2
                         continue
                 i += 1
+            elif args[i] == "--type":
+                valid_types = ("visualization", "dashboard", "search")
+                if i + 1 >= len(args):
+                    print("Error: --type requires a value: visualization, dashboard, or search")
+                    sys.exit(1)
+                type_val = args[i + 1]
+                if type_val not in valid_types:
+                    print(f"Error: invalid type '{type_val}'. Must be one of: {', '.join(valid_types)}")
+                    sys.exit(1)
+                type_filter = type_val
+                i += 2
             elif args[i] == "--json":
                 i += 1
             else:
@@ -238,7 +250,7 @@ def handle_saved_object_command(args, cfg, target, obj_type):
                 i += 1
 
         obj_ids = filtered_args if filtered_args else None
-        result = functions.export_saved_objects(cfg, target, obj_ids, obj_type=obj_type)
+        result = functions.export_saved_objects(cfg, target, obj_ids, obj_type=type_filter)
         handle_export_output(result, use_json, to_file, output_dir)
         return True
 
@@ -297,7 +309,8 @@ def main():
         print("  starsearch-cli target list                              - List all configured targets/servers")
         print("\nObject Management:")
         print("  starsearch-cli saved-object list                        - List all saved objects")
-        print("  starsearch-cli saved-object export [id1 id2 ...] [--json] - Export all saved objects")
+        print("  starsearch-cli saved-object export [id1 id2 ...] [--json] [--type <type>] - Export saved objects")
+        print("    --type <type>   Filter by type: visualization, dashboard, or search")
         print("  starsearch-cli saved-object import <file.ndjson>        - Import saved objects from ndjson")
         print("")
         print("  starsearch-cli dashboard list                           - List all dashboards")
