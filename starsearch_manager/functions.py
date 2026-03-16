@@ -1081,10 +1081,14 @@ def _extract_vis_fields(vis_obj):
                     continue
                 metrics = series.get("metrics", [])
                 if isinstance(metrics, list):
+                    # Collect all metric IDs in this series so we can
+                    # distinguish pipeline-agg internal refs from real fields.
+                    metric_ids = {m.get("id") for m in metrics
+                                  if isinstance(m, dict) and m.get("id")}
                     for m in metrics:
                         if isinstance(m, dict):
                             mfield = m.get("field")
-                            if mfield and isinstance(mfield, str):
+                            if mfield and isinstance(mfield, str) and mfield not in metric_ids:
                                 fields.append({"field": mfield, "context": f"TSVB series[{i}] metric"})
                 split_by_field = series.get("terms_field")
                 if split_by_field and isinstance(split_by_field, str):
