@@ -295,6 +295,59 @@ starsearch-cli ilm my-policy set cold-after 14
 starsearch-cli ilm my-policy set rollover 50gb 1000000
 ```
 
+### Jobs & Policy Status
+
+Inspect what the cluster is currently doing — long-running operations, queued master-level work, and how lifecycle policies are being applied to each managed index.
+
+```bash
+# Running cluster tasks (filters out monitor/internal noise by default)
+starsearch-cli jobs list
+
+# Include monitor/internal tasks
+starsearch-cli jobs list --all
+
+# Only show tasks whose action contains a substring
+starsearch-cli jobs list --filter reindex
+starsearch-cli jobs list --filter forcemerge
+
+# Pending master-level cluster tasks (cluster-state changes queued at the master)
+starsearch-cli jobs pending
+
+# In-flight ILM/ISM policy work (only indices currently being acted on,
+# retrying, or failed)
+starsearch-cli jobs policy
+```
+
+Per-index lifecycle execution status — the "how is this policy actually being applied" view. Works against both Elasticsearch ILM (`_ilm/explain`) and OpenSearch ISM (`_plugins/_ism/explain`):
+
+```bash
+# All managed indices: phase, action, step, status, retries, time-in-step, last error
+starsearch-cli ilm status
+
+# Single index (or a wildcard pattern)
+starsearch-cli ilm status my-index-000001
+starsearch-cli ilm status 'logs-*'
+
+# Only indices whose step is failed or retrying (exits 1 if any found — CI friendly)
+starsearch-cli ilm status --failed
+
+# Machine-readable
+starsearch-cli ilm status --failed --json
+```
+
+Example output:
+
+```
+Index                           Policy                   Phase   Action  Step            Status  Retries  In Step
+-----------------------------------------------------------------------------------------------------------------
+.ds-prod-logs-app-000001        observability-retention  delete  delete  attempt_delete  failed  3        1d6h
+
+Errors:
+  ✗ .ds-prod-logs-app-000001 [attempt_delete] index [.ds-prod-logs-app-000001] is the write index for data stream [prod-logs-app] and cannot be deleted
+
+Total: 1 index(es) — 1 failed
+```
+
 ### Index Operations
 
 ```bash

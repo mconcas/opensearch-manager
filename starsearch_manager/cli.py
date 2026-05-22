@@ -331,6 +331,27 @@ def main():
         print("")
         print("  starsearch-cli detector list                            - List all anomaly detection detectors")
         print("  starsearch-cli detector export [id1 id2 ...] [--json] [--to-file [path]] - Export detectors to ndjson")
+        print("\nJobs & Policy Status:")
+        print("  starsearch-cli jobs list [--all] [--filter <action>] [--json] - List running cluster tasks")
+        print("  starsearch-cli jobs pending [--json]                    - List pending master-level tasks")
+        print("  starsearch-cli jobs policy [--json]                     - List in-flight ILM/ISM lifecycle work")
+        print("  starsearch-cli ilm status [<index>] [--failed] [--json] - Per-index policy execution status")
+        print("  starsearch-cli ilm settings [--json]                    - Show plugins.index_state_management.* cluster settings (effective value + source)")
+        print("  starsearch-cli ilm schedule [<index-or-pattern>] [--json] - Show per-managed-index baked-in tick interval (from .opendistro-ism-config)")
+        print("\nPolicy Inspection & Repair (ISM):")
+        print("  starsearch-cli ilm policy show <name>                   - Show full policy definition")
+        print("  starsearch-cli ilm policy version [<index-or-pattern>] [--include-orphans] [--json] - Compare per-index policy_seq_no vs current policy")
+        print("  starsearch-cli ilm policy set-rollover <name> [--age <d>] [--size <s>] [--docs <n>] [--primary-shard-size <s>] [--state <name>] - Edit ISM rollover action (additive; pass `none` to remove)")
+        print("  starsearch-cli ilm policy set-transition <name> <from-state> <to-state> [--min-size <s>] [--min-rollover-age <d>] [--min-index-age <d>] [--min-doc-count <n>] [--position first|last] - Upsert an ISM transition (pass `none` to drop a condition; empty conditions removes the transition)")
+        print("  starsearch-cli ilm policy edit-ism-template <name> [--replace-pattern <old> <new>]* [--add-pattern <p>]* [--remove-pattern <p>]* [--entry-index <n>] [--priority <n>] - Edit ism_template entries on an ISM policy")
+        print("  starsearch-cli ilm change-policy <index-or-pattern> <policy-id> [--state <state>] - Re-enrol indices on the named policy (lifts version pinning)")
+        print("  starsearch-cli ilm retry <index-or-pattern> [--state <state>]   - Retry a failed ISM step")
+        print("  starsearch-cli ilm rollover <data-stream-or-alias>      - Manually roll over a data stream / write alias")
+        print("  starsearch-cli data-stream list [<pattern>] [--json]    - List data streams with write index & template")
+        print("  starsearch-cli component-template list [<pattern>] [--json] - List component templates and any ISM policy_id baked in")
+        print("  starsearch-cli component-template set-policy <name> <policy-id|none> - Bake an ISM policy_id into a component template (deterministic enrollment on rollover)")
+        print("  starsearch-cli index-template list [<pattern>] [--json]      - List index templates with effective policy_id (inline or via composed_of)")
+        print("  starsearch-cli index-template set-policy <name> <policy-id|none> - Bake an ISM policy_id directly into an index template")
         print("\nOther Commands:")
         print("  starsearch-cli ilm list [--all]                         - Show ILM policy info for indices")
         print("  starsearch-cli ilm <policy> set delete-after <days>     - Set delete phase for a policy")
@@ -454,11 +475,465 @@ def main():
             handle_export_output(result, use_json, to_file, output_dir)
             return
 
+    # Jobs commands
+    if len(args) >= 2 and args[0] == "jobs":
+        sub = args[1]
+        use_json = "--json" in args
+
+        if sub == "list":
+            show_all = "--all" in args
+            action_filter = None
+            if "--filter" in args:
+                idx = args.index("--filter")
+                if idx + 1 >= len(args):
+                    print("Error: --filter requires a value")
+                    sys.exit(1)
+                action_filter = args[idx + 1]
+            results = functions.list_running_tasks(cfg, target, show_all=show_all, action_filter=action_filter)
+            if isinstance(results, dict) and "error" in results:
+                print(json.dumps(results, indent=2))
+                sys.exit(1)
+            if use_json:
+                print(json.dumps(results, indent=2))
+            else:
+                functions.print_running_tasks(results)
+            return
+
+        if sub == "pending":
+            results = functions.list_pending_cluster_tasks(cfg, target)
+            if isinstance(results, dict) and "error" in results:
+                print(json.dumps(results, indent=2))
+                sys.exit(1)
+            if use_json:
+                print(json.dumps(results, indent=2))
+            else:
+                functions.print_pending_tasks(results)
+            return
+
+        if sub == "policy":
+            results = functions.list_policy_jobs(cfg, target)
+            if isinstance(results, dict) and "error" in results:
+                print(json.dumps(results, indent=2))
+                sys.exit(1)
+            if use_json:
+                print(json.dumps(results, indent=2))
+            else:
+                functions.print_policy_status(results)
+            return
+
+        print(f"Unknown jobs subcommand: {sub}")
+        print("Usage: starsearch-cli jobs <list|pending|policy> [--json] [--all] [--filter <action>]")
+        sys.exit(1)
+
+    # ILM cluster settings (`plugins.index_state_management.*`) — facts about
+    # the tick / sweep / job-interval knobs in effect on this cluster.
+    if len(args) >= 2 and args[0] == "ilm" and args[1] == "settings":
+        use_json = "--json" in args
+        result = functions.get_ism_settings(cfg, target)
+        if use_json:
+            print(json.dumps(result, indent=2))
+        else:
+            functions.print_ism_settings(result)
+        if isinstance(result, dict) and "error" in result:
+            sys.exit(1)
+        return
+
+    # Per-managed-index baked-in tick schedule from .opendistro-ism-config.
+    if len(args) >= 2 and args[0] == "ilm" and args[1] == "schedule":
+        use_json = "--json" in args
+        index_filter = None
+        for a in args[2:]:
+            if not a.startswith("-"):
+                index_filter = a
+                break
+        result = functions.get_ism_schedules(cfg, target, index_filter=index_filter)
+        if use_json:
+            print(json.dumps(result, indent=2))
+        else:
+            functions.print_ism_schedules(result)
+        if isinstance(result, dict) and "error" in result:
+            sys.exit(1)
+        return
+
+    # ILM policy inspection / mutation (must be before generic `ilm list` / `ilm status`)
+    if len(args) >= 2 and args[0] == "ilm" and args[1] == "policy":
+        if len(args) < 3:
+            print("Usage:")
+            print("  starsearch-cli ilm policy show <name>")
+            print("  starsearch-cli ilm policy version [<index-or-pattern>]")
+            print("  starsearch-cli ilm policy set-rollover <name> [--age <d>] [--size <s>] [--docs <n>] [--primary-shard-size <s>] [--state <state>]")
+            print("  starsearch-cli ilm policy set-transition <name> <from-state> <to-state> [--min-size <s>] [--min-rollover-age <d>] [--min-index-age <d>] [--min-doc-count <n>] [--position first|last]")
+            print("  starsearch-cli ilm policy edit-ism-template <name> [--replace-pattern <old> <new>]* [--add-pattern <p>]* [--remove-pattern <p>]* [--entry-index <n>] [--priority <n>]")
+            sys.exit(1)
+        sub = args[2]
+
+        if sub == "show":
+            if len(args) < 4:
+                print("Usage: starsearch-cli ilm policy show <name>")
+                sys.exit(1)
+            result = functions.get_policy(cfg, args[3], target)
+            print(json.dumps(result, indent=2))
+            return
+
+        if sub == "set-rollover":
+            if len(args) < 4:
+                print("Usage: starsearch-cli ilm policy set-rollover <name> [--age <d>] [--size <s>] [--docs <n>] [--primary-shard-size <s>] [--state <state>]")
+                print("  Each --flag is optional; pass `none` as the value to REMOVE that condition.")
+                sys.exit(1)
+            policy_name = args[3]
+            kwargs = {"state_name": "hot"}
+            flag_map = {
+                "--age": "min_index_age",
+                "--size": "min_size",
+                "--docs": "min_doc_count",
+                "--primary-shard-size": "min_primary_shard_size",
+                "--state": "state_name",
+            }
+            i = 4
+            while i < len(args):
+                if args[i] in flag_map:
+                    if i + 1 >= len(args):
+                        print(f"Error: {args[i]} requires a value")
+                        sys.exit(1)
+                    kwargs[flag_map[args[i]]] = args[i + 1]
+                    i += 2
+                else:
+                    print(f"Error: unknown flag '{args[i]}'")
+                    sys.exit(1)
+            result = functions.set_ism_rollover(cfg, target, policy_name=policy_name, **kwargs)
+            functions.print_set_rollover_result(result)
+            if not (isinstance(result, dict) and result.get("ok")):
+                sys.exit(1)
+            return
+
+        if sub == "set-transition":
+            if len(args) < 6:
+                print("Usage: starsearch-cli ilm policy set-transition <name> <from-state> <to-state> "
+                      "[--min-size <s>] [--min-rollover-age <d>] [--min-index-age <d>] "
+                      "[--min-doc-count <n>] [--position first|last]")
+                print("  At least one --min-* flag is required. Pass `none` as value to drop that condition;")
+                print("  if all conditions of the matched transition end up dropped, the transition is removed.")
+                sys.exit(1)
+            policy_name = args[3]
+            from_state = args[4]
+            to_state = args[5]
+            conditions = {}
+            position = "first"
+            cond_flag_map = {
+                "--min-size": "min_size",
+                "--min-rollover-age": "min_rollover_age",
+                "--min-index-age": "min_index_age",
+                "--min-doc-count": "min_doc_count",
+            }
+            i = 6
+            while i < len(args):
+                if args[i] in cond_flag_map:
+                    if i + 1 >= len(args):
+                        print(f"Error: {args[i]} requires a value")
+                        sys.exit(1)
+                    val = args[i + 1]
+                    if args[i] == "--min-doc-count" and val.lower() != "none":
+                        try:
+                            val = int(val)
+                        except ValueError:
+                            print(f"Error: --min-doc-count must be an integer or 'none'")
+                            sys.exit(1)
+                    conditions[cond_flag_map[args[i]]] = val
+                    i += 2
+                elif args[i] == "--position":
+                    if i + 1 >= len(args):
+                        print("Error: --position requires a value")
+                        sys.exit(1)
+                    position = args[i + 1]
+                    if position not in ("first", "last"):
+                        print("Error: --position must be 'first' or 'last'")
+                        sys.exit(1)
+                    i += 2
+                else:
+                    print(f"Error: unknown flag '{args[i]}'")
+                    sys.exit(1)
+            if not conditions:
+                print("Error: at least one --min-* condition flag is required")
+                sys.exit(1)
+            result = functions.set_ism_transition(
+                cfg, target,
+                policy_name=policy_name,
+                from_state=from_state,
+                to_state=to_state,
+                conditions=conditions,
+                position=position,
+            )
+            functions.print_set_transition_result(result)
+            if not (isinstance(result, dict) and result.get("ok")):
+                sys.exit(1)
+            return
+
+        if sub == "edit-ism-template":
+            if len(args) < 4:
+                print("Usage: starsearch-cli ilm policy edit-ism-template <name> "
+                      "[--replace-pattern <old> <new>]* [--add-pattern <p>]* "
+                      "[--remove-pattern <p>]* [--entry-index <n>] [--priority <n>]")
+                print("  Flags may repeat (except --entry-index and --priority). At least one of")
+                print("  --replace-pattern / --add-pattern / --remove-pattern / --priority is required.")
+                sys.exit(1)
+            policy_name = args[3]
+            replace_patterns = []
+            add_patterns = []
+            remove_patterns = []
+            entry_index = 0
+            priority = None
+            i = 4
+            while i < len(args):
+                flag = args[i]
+                if flag == "--replace-pattern":
+                    if i + 2 >= len(args):
+                        print("Error: --replace-pattern requires two values: <old> <new>")
+                        sys.exit(1)
+                    replace_patterns.append((args[i + 1], args[i + 2]))
+                    i += 3
+                elif flag == "--add-pattern":
+                    if i + 1 >= len(args):
+                        print("Error: --add-pattern requires a value")
+                        sys.exit(1)
+                    add_patterns.append(args[i + 1])
+                    i += 2
+                elif flag == "--remove-pattern":
+                    if i + 1 >= len(args):
+                        print("Error: --remove-pattern requires a value")
+                        sys.exit(1)
+                    remove_patterns.append(args[i + 1])
+                    i += 2
+                elif flag == "--entry-index":
+                    if i + 1 >= len(args):
+                        print("Error: --entry-index requires a value")
+                        sys.exit(1)
+                    try:
+                        entry_index = int(args[i + 1])
+                    except ValueError:
+                        print("Error: --entry-index must be an integer")
+                        sys.exit(1)
+                    i += 2
+                elif flag == "--priority":
+                    if i + 1 >= len(args):
+                        print("Error: --priority requires a value")
+                        sys.exit(1)
+                    try:
+                        priority = int(args[i + 1])
+                    except ValueError:
+                        print("Error: --priority must be an integer")
+                        sys.exit(1)
+                    i += 2
+                else:
+                    print(f"Error: unknown flag '{flag}'")
+                    sys.exit(1)
+            if not (replace_patterns or add_patterns or remove_patterns or priority is not None):
+                print("Error: at least one of --replace-pattern / --add-pattern / --remove-pattern / --priority is required")
+                sys.exit(1)
+            result = functions.edit_ism_template(
+                cfg, target,
+                policy_name=policy_name,
+                replace_patterns=replace_patterns,
+                add_patterns=add_patterns,
+                remove_patterns=remove_patterns,
+                entry_index=entry_index,
+                priority=priority,
+            )
+            functions.print_edit_ism_template_result(result)
+            if not (isinstance(result, dict) and result.get("ok")):
+                sys.exit(1)
+            return
+
+        if sub == "version":
+            use_json = "--json" in args
+            include_orphans = "--include-orphans" in args
+            index_filter = None
+            for a in args[3:]:
+                if not a.startswith("-"):
+                    index_filter = a
+                    break
+            result = functions.get_policy_version_drift(
+                cfg, target,
+                index_filter=index_filter,
+                include_orphans=include_orphans,
+            )
+            if use_json:
+                print(json.dumps(result, indent=2))
+            else:
+                functions.print_policy_version_drift(result)
+            if isinstance(result, list) and any(
+                r.get("orphan") or (not r["enrolled"]) or r["drift"] for r in result
+            ):
+                sys.exit(2)  # signal drift/orphan to scripts (skills)
+            return
+
+        print(f"Unknown ilm policy subcommand: {sub}")
+        sys.exit(1)
+
+    # ILM change-policy (apply latest policy version, or enrol un-managed indices)
+    if len(args) >= 2 and args[0] == "ilm" and args[1] == "change-policy":
+        if len(args) < 4:
+            print("Usage: starsearch-cli ilm change-policy <index-or-pattern> <policy-id> [--state <state>]")
+            sys.exit(1)
+        pattern = args[2]
+        policy_id = args[3]
+        state = None
+        if "--state" in args:
+            idx = args.index("--state")
+            if idx + 1 >= len(args):
+                print("Error: --state requires a value")
+                sys.exit(1)
+            state = args[idx + 1]
+        results = functions.change_policy_for_indices(
+            cfg, target, index_patterns=[pattern], policy_id=policy_id, state=state
+        )
+        functions.print_change_policy_results(results)
+        return
+
+    # ILM retry (failed managed indices)
+    if len(args) >= 2 and args[0] == "ilm" and args[1] == "retry":
+        if len(args) < 3:
+            print("Usage: starsearch-cli ilm retry <index-or-pattern> [--state <state>]")
+            sys.exit(1)
+        pattern = args[2]
+        state = None
+        if "--state" in args:
+            idx = args.index("--state")
+            if idx + 1 >= len(args):
+                print("Error: --state requires a value")
+                sys.exit(1)
+            state = args[idx + 1]
+        results = functions.retry_ism_for_indices(
+            cfg, target, index_patterns=[pattern], state=state
+        )
+        functions.print_change_policy_results(results)
+        return
+
+    # ILM rollover (manual rollover of a data stream / write alias)
+    if len(args) >= 2 and args[0] == "ilm" and args[1] == "rollover":
+        if len(args) < 3:
+            print("Usage: starsearch-cli ilm rollover <data-stream-or-alias>")
+            sys.exit(1)
+        name = args[2]
+        result = functions.rollover_index(cfg, target, name=name)
+        print(json.dumps(result, indent=2))
+        if not result.get("ok"):
+            sys.exit(1)
+        return
+
+    # Index template inspection / mutation
+    if len(args) >= 2 and args[0] == "index-template":
+        sub = args[1]
+        if sub == "list":
+            use_json = "--json" in args
+            name_filter = None
+            for a in args[2:]:
+                if not a.startswith("-"):
+                    name_filter = a
+                    break
+            result = functions.list_index_templates(cfg, target, name_filter=name_filter)
+            if use_json:
+                print(json.dumps(result, indent=2))
+            else:
+                functions.print_index_templates(result)
+            return
+        if sub == "set-policy":
+            if len(args) < 4:
+                print("Usage: starsearch-cli index-template set-policy <template-name> <policy-id|none>")
+                print("  Use 'none' as policy-id to REMOVE the ISM policy setting.")
+                sys.exit(1)
+            template_name = args[2]
+            policy_id = args[3]
+            result = functions.set_index_template_policy(
+                cfg, target, template_name=template_name, policy_id=policy_id
+            )
+            functions.print_set_index_template_result(result)
+            if not (isinstance(result, dict) and result.get("ok")):
+                sys.exit(1)
+            return
+        print(f"Unknown index-template subcommand: {sub}")
+        sys.exit(1)
+
+    # Component template inspection / mutation
+    if len(args) >= 2 and args[0] == "component-template":
+        sub = args[1]
+        if sub == "list":
+            use_json = "--json" in args
+            name_filter = None
+            for a in args[2:]:
+                if not a.startswith("-"):
+                    name_filter = a
+                    break
+            result = functions.list_component_templates(cfg, target, name_filter=name_filter)
+            if use_json:
+                print(json.dumps(result, indent=2))
+            else:
+                functions.print_component_templates(result)
+            return
+        if sub == "set-policy":
+            if len(args) < 4:
+                print("Usage: starsearch-cli component-template set-policy <template-name> <policy-id|none>")
+                print("  Use 'none' as policy-id to REMOVE the ISM policy setting.")
+                sys.exit(1)
+            template_name = args[2]
+            policy_id = args[3]
+            result = functions.set_component_template_policy(
+                cfg, target, template_name=template_name, policy_id=policy_id
+            )
+            functions.print_set_component_template_result(result)
+            if not (isinstance(result, dict) and result.get("ok")):
+                sys.exit(1)
+            return
+        print(f"Unknown component-template subcommand: {sub}")
+        sys.exit(1)
+
+    # Data stream commands
+    if len(args) >= 2 and args[0] == "data-stream":
+        sub = args[1]
+        if sub == "list":
+            use_json = "--json" in args
+            name_filter = None
+            for a in args[2:]:
+                if not a.startswith("-"):
+                    name_filter = a
+                    break
+            result = functions.list_data_streams(cfg, target, name_filter=name_filter)
+            if use_json:
+                print(json.dumps(result, indent=2))
+            else:
+                functions.print_data_streams(result)
+            return
+        print(f"Unknown data-stream subcommand: {sub}")
+        sys.exit(1)
+
     # ILM commands
     if len(args) >= 2 and args[0] == "ilm" and args[1] == "list":
         show_all = "--all" in args or "--all" in sys.argv
         results = functions.get_index_lifecycle_info(cfg, target, show_all)
         functions.print_table(results)
+        return
+
+    # ILM status (per-index policy execution explain)
+    if len(args) >= 2 and args[0] == "ilm" and args[1] == "status":
+        use_json = "--json" in args
+        failed_only = "--failed" in args
+        # First non-flag positional after `status` is an optional index filter.
+        index_filter = None
+        for a in args[2:]:
+            if not a.startswith("-"):
+                index_filter = a
+                break
+        results = functions.get_policy_status(
+            cfg, target, index_filter=index_filter, failed_only=failed_only
+        )
+        if isinstance(results, dict) and "error" in results:
+            print(json.dumps(results, indent=2))
+            sys.exit(1)
+        if use_json:
+            print(json.dumps(results, indent=2))
+        else:
+            functions.print_policy_status(results)
+            if failed_only and any(r["step_status"] in ("failed", "retrying") for r in results):
+                sys.exit(1)
         return
 
     if len(args) >= 4 and args[0] == "ilm" and args[2] == "set":

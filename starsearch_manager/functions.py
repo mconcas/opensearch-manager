@@ -15,6 +15,62 @@ COLORS = {
     "reset": "\033[0m"
 }
 
+# Status colors for jobs / policy execution tables
+STATUS_COLORS = {
+    "failed":     "\033[91m",  # red
+    "retrying":   "\033[91m",  # red
+    "running":    "\033[93m",  # yellow
+    "in_progress":"\033[93m",  # yellow
+    "starting":   "\033[93m",  # yellow
+    "condition_not_met": "\033[93m",
+    "completed":  "\033[92m",  # green
+    "success":    "\033[92m",  # green
+    "ok":         "\033[92m",  # green
+    "URGENT":     "\033[91m",
+    "HIGH":       "\033[93m",
+    "NORMAL":     "",
+    "LOW":        "\033[94m",
+    "reset":      "\033[0m"
+}
+
+
+def format_duration(value, unit="ms"):
+    """Format a duration value into a compact human-readable string.
+
+    unit: 'ms' or 'ns'.
+    """
+    if value is None:
+        return "-"
+    try:
+        v = int(value)
+    except (TypeError, ValueError):
+        return "-"
+    if unit == "ns":
+        v = v // 1_000_000  # to ms
+    if v < 1000:
+        return f"{v}ms"
+    seconds = v / 1000.0
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes = seconds / 60.0
+    if minutes < 60:
+        return f"{int(minutes)}m{int(seconds % 60)}s"
+    hours = minutes / 60.0
+    if hours < 24:
+        return f"{int(hours)}h{int(minutes % 60)}m"
+    days = hours / 24.0
+    return f"{int(days)}d{int(hours % 24)}h"
+
+
+def _detect_distribution(base_url, auth, verify_ssl):
+    """Return True if the cluster behind base_url is OpenSearch."""
+    try:
+        resp = requests.get(f"{base_url}/", auth=auth, verify=verify_ssl)
+        info = resp.json()
+        return "opensearch" in info.get("version", {}).get("distribution", "").lower()
+    except Exception:
+        return False
+
 
 def parse_age_to_days(age_str):
     """Convert age string like '30d', '2h' to days."""
@@ -1633,3 +1689,1806 @@ def import_saved_objects(config, ndjson_content, target=None, obj_type=None):
         })
 
     return {'imported': imported, 'skipped': skipped}
+
+
+# ---------------------------------------------------------------------------
+# Jobs / running work inspection
+# ---------------------------------------------------------------------------
+
+# Internal-noise actions filtered out of `jobs list` by default.
+_NOISY_TASK_ACTIONS_PREFIXES = (
+    "cluster:monitor/",
+    "indices:monitor/",
+    "internal:",
+)
+
+
+def list_running_tasks(config, target=None, show_all=False, action_filter=None):
+    """List currently running tasks via the _tasks API.
+
+    Args:
+        show_all: include monitoring/internal noise.
+        action_filter: optional substring; only tasks whose action contains it are kept.
+    """
+    from .cli import get_server, get_auth, get_verify_ssl, get_cluster_base_url
+
+    server, _ = get_server(config, target)
+    base_url = get_cluster_base_url(server)
+    auth = get_auth(server)
+    verify_ssl = get_verify_ssl(server)
+
+    resp = requests.get(
+        f"{base_url}/_tasks?detailed=true",
+        auth=auth,
+        verify=verify_ssl,
+    )
+    if resp.status_code != 200:
+        return {"error": f"Failed to fetch tasks: {resp.status_code} - {resp.text}"}
+
+    data = resp.json()
+    results = []
+    for node_id, node_info in data.get("nodes", {}).items():
+        node_name = node_info.get("name", node_id)
+        for task_id, task in node_info.get("tasks", {}).items():
+            action = task.get("action", "")
+            if not show_all and any(action.startswith(p) for p in _NOISY_TASK_ACTIONS_PREFIXES):
+                continue
+            if action_filter and action_filter not in action:
+                continue
+
+            description = task.get("description", "") or ""
+            if len(description) > 80:
+                description = description[:77] + "..."
+
+            results.append({
+                "task_id": task_id,
+                "node": node_name,
+                "action": action,
+                "running_time": format_duration(task.get("running_time_in_nanos"), unit="ns"),
+                "running_time_ms": (task.get("running_time_in_nanos") or 0) // 1_000_000,
+                "cancellable": task.get("cancellable", False),
+                "parent_task": task.get("parent_task_id", "-"),
+                "description": description,
+            })
+
+    # Show oldest (longest-running) first.
+    results.sort(key=lambda r: r["running_time_ms"], reverse=True)
+    return results
+
+
+def list_pending_cluster_tasks(config, target=None):
+    """List pending master-level cluster tasks (_cluster/pending_tasks)."""
+    from .cli import get_server, get_auth, get_verify_ssl, get_cluster_base_url
+
+    server, _ = get_server(config, target)
+    base_url = get_cluster_base_url(server)
+    auth = get_auth(server)
+    verify_ssl = get_verify_ssl(server)
+
+    resp = requests.get(
+        f"{base_url}/_cluster/pending_tasks",
+        auth=auth,
+        verify=verify_ssl,
+    )
+    if resp.status_code != 200:
+        return {"error": f"Failed to fetch pending tasks: {resp.status_code} - {resp.text}"}
+
+    data = resp.json()
+    results = []
+    for t in data.get("tasks", []):
+        source = t.get("source", "") or ""
+        if len(source) > 90:
+            source = source[:87] + "..."
+        results.append({
+            "insert_order": t.get("insert_order"),
+            "priority": t.get("priority", "-"),
+            "time_in_queue": t.get("time_in_queue", format_duration(t.get("time_in_queue_millis"))),
+            "time_in_queue_ms": t.get("time_in_queue_millis", 0),
+            "source": source,
+        })
+
+    results.sort(key=lambda r: r["time_in_queue_ms"], reverse=True)
+    return results
+
+
+def list_policy_jobs(config, target=None):
+    """List in-flight ISM/ILM policy work: indices currently being acted on by lifecycle.
+
+    Filters the per-index explain output down to rows whose step is in a non-terminal
+    state (running / retrying / failed / starting / condition_not_met).
+    """
+    rows = get_policy_status(config, target=target)
+    if isinstance(rows, dict) and "error" in rows:
+        return rows
+
+    active_statuses = {
+        "running", "in_progress", "starting", "retrying", "failed", "condition_not_met"
+    }
+    return [r for r in rows if r["step_status"] in active_statuses]
+
+
+def get_policy_status(config, target=None, index_filter=None, failed_only=False):
+    """Per-index lifecycle execution status (current step, action, retries, errors).
+
+    Works against OpenSearch ISM (_plugins/_ism/explain) and Elasticsearch ILM
+    (_ilm/explain). Returns a normalized list of dicts.
+
+    Args:
+        index_filter: optional index name / pattern (e.g. "logs-*"). Defaults to '*'.
+        failed_only: keep only rows whose step is failed or retrying.
+    """
+    from .cli import get_server, get_auth, get_verify_ssl, get_cluster_base_url
+
+    server, _ = get_server(config, target)
+    base_url = get_cluster_base_url(server)
+    auth = get_auth(server)
+    verify_ssl = get_verify_ssl(server)
+
+    is_opensearch = _detect_distribution(base_url, auth, verify_ssl)
+    target_pattern = index_filter or "*"
+
+    now_ms = int(datetime.now().timestamp() * 1000)
+
+    if is_opensearch:
+        url = f"{base_url}/_plugins/_ism/explain/{target_pattern}"
+        resp = requests.get(url, auth=auth, verify=verify_ssl)
+        if resp.status_code != 200:
+            return {"error": f"Failed to fetch ISM explain: {resp.status_code} - {resp.text}"}
+        data = resp.json()
+    else:
+        url = f"{base_url}/{target_pattern}/_ilm/explain"
+        resp = requests.get(url, auth=auth, verify=verify_ssl)
+        if resp.status_code != 200:
+            return {"error": f"Failed to fetch ILM explain: {resp.status_code} - {resp.text}"}
+        data = resp.json().get("indices", {})
+
+    results = []
+    for index_name, info in data.items():
+        if not isinstance(info, dict):
+            continue
+
+        if is_opensearch:
+            policy_id = (
+                info.get("index.plugins.index_state_management.policy_id")
+                or info.get("policy_id")
+            )
+            if not policy_id:
+                # Index is not managed by ISM; skip.
+                continue
+
+            state = info.get("state") or {}
+            action = info.get("action") or {}
+            step = info.get("step") or {}
+            retry_info = info.get("retry_info") or {}
+            info_msg = info.get("info") or {}
+
+            step_status = (step.get("step_status") or "").lower() or "unknown"
+            failed_flag = bool(action.get("failed") or retry_info.get("failed"))
+            if failed_flag and step_status not in ("failed", "retrying"):
+                step_status = "failed"
+            retries = action.get("consumed_retries") or retry_info.get("consumed_retries") or 0
+
+            step_start = step.get("start_time")
+            time_in_step = format_duration(now_ms - step_start) if step_start else "-"
+
+            error = ""
+            if isinstance(info_msg, dict):
+                error = info_msg.get("cause") or info_msg.get("message") or ""
+            elif isinstance(info_msg, str):
+                error = info_msg
+            if not error and failed_flag:
+                error = "(see ISM history)"
+
+            row = {
+                "index": index_name,
+                "policy": policy_id,
+                "phase": state.get("name") or "-",
+                "action": action.get("name") or "-",
+                "step": step.get("name") or "-",
+                "step_status": step_status,
+                "retries": int(retries) if retries is not None else 0,
+                "time_in_step": time_in_step,
+                "error": (error or "").strip(),
+            }
+        else:
+            if not info.get("managed"):
+                continue
+            phase = info.get("phase", "-")
+            action_name = info.get("action", "-")
+            step_name = info.get("step", "-")
+            failed_step = info.get("failed_step")
+            retries = info.get("failed_step_retry_count", 0) or 0
+
+            if failed_step:
+                step_status = "retrying" if info.get("is_auto_retryable_error") else "failed"
+                step_name = f"{step_name} (failed: {failed_step})"
+            elif step_name in ("complete", "completed"):
+                step_status = "completed"
+            else:
+                step_status = "running"
+
+            step_info = info.get("step_info") or {}
+            if isinstance(step_info, dict):
+                error = (
+                    step_info.get("reason")
+                    or step_info.get("message")
+                    or step_info.get("type")
+                    or ""
+                )
+            else:
+                error = str(step_info)
+
+            row = {
+                "index": index_name,
+                "policy": info.get("policy", "-"),
+                "phase": phase,
+                "action": action_name,
+                "step": step_name,
+                "step_status": step_status,
+                "retries": int(retries),
+                "time_in_step": format_duration(info.get("step_time_millis") and now_ms - info["step_time_millis"]),
+                "error": (error or "").strip(),
+            }
+
+        if failed_only and row["step_status"] not in ("failed", "retrying"):
+            continue
+
+        results.append(row)
+
+    # Sort: failures first, then by index name.
+    sort_rank = {"failed": 0, "retrying": 1, "running": 2, "in_progress": 2,
+                 "starting": 3, "condition_not_met": 4, "completed": 5}
+    results.sort(key=lambda r: (sort_rank.get(r["step_status"], 9), r["index"]))
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Printers for the jobs / policy-status tables
+# ---------------------------------------------------------------------------
+
+def _print_columns(rows, columns):
+    """Print rows as a simple aligned table.
+
+    columns: list of (header, key, color_key_or_None) tuples.
+    """
+    if not rows:
+        return
+
+    headers = [c[0] for c in columns]
+    widths = [len(h) for h in headers]
+    for r in rows:
+        for i, (_, key, _) in enumerate(columns):
+            widths[i] = max(widths[i], len(str(r.get(key, "") or "-")))
+
+    header_row = "  ".join(h.ljust(w) for h, w in zip(headers, widths))
+    print(header_row)
+    print("-" * len(header_row))
+
+    for r in rows:
+        cells = []
+        for i, (_, key, color_key) in enumerate(columns):
+            val = str(r.get(key, "") or "-")
+            color = ""
+            if color_key:
+                color = STATUS_COLORS.get(str(r.get(color_key, "")), "")
+            reset = STATUS_COLORS["reset"] if color else ""
+            cells.append(f"{color}{val.ljust(widths[i])}{reset}")
+        print("  ".join(cells))
+
+
+def print_running_tasks(results):
+    if not results:
+        print("No running tasks")
+        return
+    _print_columns(results, [
+        ("Task",        "task_id",      None),
+        ("Node",        "node",         None),
+        ("Action",      "action",       None),
+        ("Running",     "running_time", None),
+        ("Parent",      "parent_task",  None),
+        ("Description", "description",  None),
+    ])
+    print(f"\nTotal: {len(results)} task(s)")
+
+
+def print_pending_tasks(results):
+    if not results:
+        print("No pending cluster tasks")
+        return
+    _print_columns(results, [
+        ("Order",    "insert_order",  None),
+        ("Priority", "priority",      "priority"),
+        ("Waiting",  "time_in_queue", None),
+        ("Source",   "source",        None),
+    ])
+    print(f"\nTotal: {len(results)} pending task(s)")
+
+
+# ---------------------------------------------------------------------------
+# Policy inspection / mutation (ISM and ILM)
+# ---------------------------------------------------------------------------
+
+def get_policy(config, policy_name, target=None):
+    """Fetch a single ISM (OpenSearch) or ILM (Elasticsearch) policy by name."""
+    from .cli import get_server, get_auth, get_verify_ssl, get_cluster_base_url
+
+    server, _ = get_server(config, target)
+    base_url = get_cluster_base_url(server)
+    auth = get_auth(server)
+    verify_ssl = get_verify_ssl(server)
+
+    is_opensearch = _detect_distribution(base_url, auth, verify_ssl)
+    if is_opensearch:
+        url = f"{base_url}/_plugins/_ism/policies/{policy_name}"
+    else:
+        url = f"{base_url}/_ilm/policy/{policy_name}"
+
+    resp = requests.get(url, auth=auth, verify=verify_ssl)
+    if resp.status_code == 404:
+        return {"error": f"Policy '{policy_name}' not found"}
+    if resp.status_code != 200:
+        return {"error": f"HTTP {resp.status_code}: {resp.text}"}
+    return resp.json()
+
+
+def get_ism_settings(config, target=None):
+    """Fetch all `plugins.index_state_management.*` cluster settings with their
+    effective value and source (persistent / transient / default).
+
+    Returns a list of dicts: {"key": ..., "value": ..., "source": ...}.
+    OpenSearch only — ILM has a different (and limited) set of cluster knobs.
+    """
+    from .cli import get_server, get_auth, get_verify_ssl, get_cluster_base_url
+
+    server, _ = get_server(config, target)
+    base_url = get_cluster_base_url(server)
+    auth = get_auth(server)
+    verify_ssl = get_verify_ssl(server)
+
+    is_opensearch = _detect_distribution(base_url, auth, verify_ssl)
+    if not is_opensearch:
+        return {"error": "ilm settings is OpenSearch ISM-only"}
+
+    resp = requests.get(
+        f"{base_url}/_cluster/settings?include_defaults=true&flat_settings=true",
+        auth=auth, verify=verify_ssl,
+    )
+    if resp.status_code != 200:
+        return {"error": f"HTTP {resp.status_code}: {resp.text}"}
+    data = resp.json()
+
+    PREFIX = "plugins.index_state_management."
+    # Higher priority overrides lower: persistent > transient > defaults.
+    merged = {}
+    for source in ("defaults", "transient", "persistent"):
+        block = data.get(source, {}) or {}
+        for k, v in block.items():
+            if k.startswith(PREFIX):
+                merged[k] = {"key": k, "value": v, "source": source}
+    return sorted(merged.values(), key=lambda r: r["key"])
+
+
+def print_ism_settings(rows):
+    if isinstance(rows, dict) and "error" in rows:
+        print(json.dumps(rows, indent=2))
+        return
+    if not rows:
+        print("No plugins.index_state_management.* cluster settings found")
+        return
+    headers = ["Setting", "Value", "Source"]
+    widths = [len(h) for h in headers]
+    for r in rows:
+        widths[0] = max(widths[0], len(r["key"]))
+        widths[1] = max(widths[1], len(str(r["value"])))
+        widths[2] = max(widths[2], len(r["source"]))
+    fmt = "  ".join("{:<" + str(w) + "}" for w in widths)
+    print(fmt.format(*headers))
+    print("-" * (sum(widths) + 2 * (len(widths) - 1)))
+    for r in rows:
+        # Highlight non-default sources so overrides stand out.
+        color = "\033[93m" if r["source"] != "defaults" else ""
+        reset = "\033[0m" if color else ""
+        print(color + fmt.format(r["key"], str(r["value"]), r["source"]) + reset)
+
+
+def get_ism_schedules(config, target=None, index_filter=None):
+    """Fetch baked-in `schedule.interval` from each managed_index doc in
+    .opendistro-ism-config.
+
+    These per-index schedules are set at managed_index creation (from the
+    cluster `plugins.index_state_management.job_interval` at that moment) and
+    are NOT updated when the cluster setting changes — that's the load-bearing
+    fact when reasoning about tick frequency on an already-managed index.
+
+    Returns a list of dicts:
+        {"index": ..., "policy_id": ..., "interval": <int>, "unit": "Minutes",
+         "start_time_ms": <epoch ms>, "policy_seq_no": ...}
+    """
+    from .cli import get_server, get_auth, get_verify_ssl, get_cluster_base_url
+
+    server, _ = get_server(config, target)
+    base_url = get_cluster_base_url(server)
+    auth = get_auth(server)
+    verify_ssl = get_verify_ssl(server)
+
+    is_opensearch = _detect_distribution(base_url, auth, verify_ssl)
+    if not is_opensearch:
+        return {"error": "ilm schedule is OpenSearch ISM-only"}
+
+    body = {
+        "size": 1000,
+        "query": {"exists": {"field": "managed_index"}},
+        "_source": [
+            "managed_index.index",
+            "managed_index.policy_id",
+            "managed_index.policy_seq_no",
+            "managed_index.schedule",
+        ],
+    }
+    resp = requests.get(
+        f"{base_url}/.opendistro-ism-config/_search",
+        auth=auth, verify=verify_ssl,
+        headers={"Content-Type": "application/json"},
+        json=body,
+    )
+    if resp.status_code != 200:
+        return {"error": f"HTTP {resp.status_code}: {resp.text}"}
+
+    rows = []
+    for hit in resp.json().get("hits", {}).get("hits", []):
+        mi = hit.get("_source", {}).get("managed_index") or {}
+        idx = mi.get("index")
+        if index_filter and not _glob_match(idx, index_filter):
+            continue
+        sched = mi.get("schedule", {}).get("interval", {}) or {}
+        rows.append({
+            "index": idx,
+            "policy_id": mi.get("policy_id"),
+            "policy_seq_no": mi.get("policy_seq_no"),
+            "interval": sched.get("period"),
+            "unit": sched.get("unit"),
+            "start_time_ms": sched.get("start_time"),
+        })
+    rows.sort(key=lambda r: (r["interval"] or 0, r["index"] or ""))
+    return rows
+
+
+def _glob_match(name, pattern):
+    if not pattern or pattern == "*":
+        return True
+    import fnmatch
+    return fnmatch.fnmatchcase(name or "", pattern)
+
+
+def print_ism_schedules(rows):
+    if isinstance(rows, dict) and "error" in rows:
+        print(json.dumps(rows, indent=2))
+        return
+    if not rows:
+        print("No managed indices found")
+        return
+    from collections import Counter
+    dist = Counter((r["interval"], r["unit"]) for r in rows)
+
+    headers = ["Index", "Policy", "Interval", "Unit", "Policy Seq"]
+    widths = [len(h) for h in headers]
+    for r in rows:
+        widths[0] = max(widths[0], len(r["index"] or ""))
+        widths[1] = max(widths[1], len(r["policy_id"] or ""))
+        widths[2] = max(widths[2], len(str(r["interval"])))
+        widths[3] = max(widths[3], len(r["unit"] or ""))
+        widths[4] = max(widths[4], len(str(r["policy_seq_no"])))
+    fmt = "  ".join("{:<" + str(w) + "}" for w in widths)
+    print(fmt.format(*headers))
+    print("-" * (sum(widths) + 2 * (len(widths) - 1)))
+    for r in rows:
+        print(fmt.format(
+            r["index"] or "-",
+            r["policy_id"] or "-",
+            str(r["interval"]),
+            r["unit"] or "-",
+            str(r["policy_seq_no"]),
+        ))
+    print("\nInterval distribution:")
+    for (period, unit), n in sorted(dist.items(), key=lambda kv: -kv[1]):
+        print(f"  {n:>4} index(es) on {period} {unit}")
+
+
+def get_policy_version_drift(config, target=None, index_filter=None, include_orphans=False):
+    """Compare each managed index's policy version to the latest version of that policy.
+
+    Returns a list of dicts:
+        {
+            "index": ".ds-...",
+            "policy": "observability-retention",
+            "index_seq_no": 1505267,
+            "current_seq_no": 1512556,
+            "drift": True / False,
+            "enrolled": True / False,   # False if policy_id is set but no state exists
+            "orphan": True / False,     # True if no policy_id setting at all
+            "state": "hot" | "-" ...,
+            "step_status": "...",
+        }
+
+    When include_orphans=True, also emits rows for indices that have no
+    `policy_id` setting at all (the rollover-template race outcome: a new
+    backing index came up without ISM stamping a policy). Orphans are
+    restricted to non-system indices (skips `.opendistro*`, `.kibana*`,
+    `.opensearch*`) so the output isn't polluted by internal indices.
+
+    OpenSearch only — ILM doesn't expose a comparable seq_no.
+    """
+    from .cli import get_server, get_auth, get_verify_ssl, get_cluster_base_url
+
+    server, _ = get_server(config, target)
+    base_url = get_cluster_base_url(server)
+    auth = get_auth(server)
+    verify_ssl = get_verify_ssl(server)
+
+    is_opensearch = _detect_distribution(base_url, auth, verify_ssl)
+    if not is_opensearch:
+        return {"error": "policy version drift is OpenSearch ISM-only (no equivalent in ILM)"}
+
+    target_pattern = index_filter or "*"
+    resp = requests.get(
+        f"{base_url}/_plugins/_ism/explain/{target_pattern}",
+        auth=auth, verify=verify_ssl,
+    )
+    if resp.status_code != 200:
+        return {"error": f"Failed to fetch ISM explain: {resp.status_code} - {resp.text}"}
+    data = resp.json()
+
+    # Cache current policy seq_no per policy_id so we hit the policies API at most once each.
+    policy_meta_cache = {}
+    def _policy_seq(policy_name):
+        if policy_name in policy_meta_cache:
+            return policy_meta_cache[policy_name]
+        pr = requests.get(
+            f"{base_url}/_plugins/_ism/policies/{policy_name}",
+            auth=auth, verify=verify_ssl,
+        )
+        if pr.status_code == 200:
+            j = pr.json()
+            policy_meta_cache[policy_name] = j.get("_seq_no")
+        else:
+            policy_meta_cache[policy_name] = None
+        return policy_meta_cache[policy_name]
+
+    SYSTEM_PREFIXES = (".opendistro", ".kibana", ".opensearch", ".plugins")
+
+    rows = []
+    for index_name, info in data.items():
+        if not isinstance(info, dict):
+            continue
+        policy_id = (
+            info.get("index.plugins.index_state_management.policy_id")
+            or info.get("policy_id")
+        )
+        if not policy_id:
+            if not include_orphans:
+                continue
+            if index_name.startswith(SYSTEM_PREFIXES):
+                continue
+            rows.append({
+                "index": index_name,
+                "policy": None,
+                "index_seq_no": None,
+                "current_seq_no": None,
+                "drift": False,
+                "enrolled": False,
+                "orphan": True,
+                "state": "-",
+                "step_status": "-",
+            })
+            continue
+
+        index_seq = info.get("policy_seq_no")
+        current_seq = _policy_seq(policy_id)
+        state = info.get("state") or {}
+        step = info.get("step") or {}
+        enrolled = index_seq is not None and bool(state)
+        drift = (
+            enrolled
+            and current_seq is not None
+            and index_seq != current_seq
+        )
+
+        rows.append({
+            "index": index_name,
+            "policy": policy_id,
+            "index_seq_no": index_seq,
+            "current_seq_no": current_seq,
+            "drift": drift,
+            "enrolled": enrolled,
+            "orphan": False,
+            "state": (state.get("name") if state else None) or "-",
+            "step_status": (step.get("step_status") or "-") if step else "-",
+        })
+
+    # Stable sort: orphan first, then not-enrolled, then drifted, then in-sync.
+    def _rank(r):
+        if r.get("orphan"):
+            return 0
+        if not r["enrolled"]:
+            return 1
+        if r["drift"]:
+            return 2
+        return 3
+    rows.sort(key=lambda r: (_rank(r), r["index"]))
+    return rows
+
+
+def print_policy_version_drift(rows):
+    """Print policy version drift table."""
+    if isinstance(rows, dict) and "error" in rows:
+        print(json.dumps(rows, indent=2))
+        return
+    if not rows:
+        print("No managed indices found")
+        return
+
+    headers = ["Index", "Policy", "Index Seq", "Current Seq", "Enrolled", "Drift", "State", "Step Status"]
+    widths = [len(h) for h in headers]
+    for r in rows:
+        widths[0] = max(widths[0], len(r["index"]))
+        widths[1] = max(widths[1], len(str(r["policy"])))
+        widths[2] = max(widths[2], len(str(r["index_seq_no"] if r["index_seq_no"] is not None else "-")))
+        widths[3] = max(widths[3], len(str(r["current_seq_no"] if r["current_seq_no"] is not None else "-")))
+        widths[6] = max(widths[6], len(r["state"] or "-"))
+        widths[7] = max(widths[7], len(r["step_status"] or "-"))
+
+    header_row = "  ".join(h.ljust(w) for h, w in zip(headers, widths))
+    print(header_row)
+    print("-" * len(header_row))
+
+    for r in rows:
+        if r.get("orphan"):
+            color = "\033[95m"     # magenta — no policy_id at all
+        elif not r["enrolled"]:
+            color = "\033[91m"     # red — not enrolled
+        elif r["drift"]:
+            color = "\033[93m"     # yellow — stale version
+        else:
+            color = "\033[92m"     # green — in sync
+        reset = "\033[0m"
+        line = [
+            r["index"].ljust(widths[0]),
+            (r["policy"] or "-").ljust(widths[1]),
+            str(r["index_seq_no"] if r["index_seq_no"] is not None else "-").ljust(widths[2]),
+            str(r["current_seq_no"] if r["current_seq_no"] is not None else "-").ljust(widths[3]),
+            ("yes" if r["enrolled"] else "no").ljust(widths[4]),
+            ("yes" if r["drift"] else "no").ljust(widths[5]),
+            (r["state"] or "-").ljust(widths[6]),
+            (r["step_status"] or "-").ljust(widths[7]),
+        ]
+        print(color + "  ".join(line) + reset)
+
+    n_orphan = sum(1 for r in rows if r.get("orphan"))
+    n_drift = sum(1 for r in rows if r["drift"])
+    n_unenrolled = sum(1 for r in rows if not r["enrolled"] and not r.get("orphan"))
+    n_ok = len(rows) - n_drift - n_unenrolled - n_orphan
+    parts = [
+        f"\033[92m{n_ok} in sync\033[0m",
+        f"\033[93m{n_drift} drifted\033[0m",
+        f"\033[91m{n_unenrolled} not enrolled\033[0m",
+    ]
+    if n_orphan:
+        parts.append(f"\033[95m{n_orphan} orphan\033[0m")
+    print(f"\nTotal: {len(rows)} index(es) — " + ", ".join(parts))
+
+
+def list_index_templates(config, target=None, name_filter=None):
+    """List composable index templates: GET _index_template[/pattern].
+
+    Surfaces whether each template carries an ISM policy_id (either inline in
+    template.settings or via its composed_of component templates).
+    """
+    from .cli import get_server, get_auth, get_verify_ssl, get_cluster_base_url
+
+    server, _ = get_server(config, target)
+    base_url = get_cluster_base_url(server)
+    auth = get_auth(server)
+    verify_ssl = get_verify_ssl(server)
+
+    suffix = f"/{name_filter}" if name_filter else ""
+    resp = requests.get(f"{base_url}/_index_template{suffix}", auth=auth, verify=verify_ssl)
+    if resp.status_code != 200:
+        return {"error": f"HTTP {resp.status_code}: {resp.text}"}
+    data = resp.json()
+
+    # Build a side cache of component-template policy_ids so we can show inherited ones.
+    ct_cache = {}
+    ct_resp = requests.get(f"{base_url}/_component_template", auth=auth, verify=verify_ssl)
+    if ct_resp.status_code == 200:
+        for entry in ct_resp.json().get("component_templates", []):
+            ct = entry.get("component_template", {})
+            settings = ct.get("template", {}).get("settings", {}) or {}
+            pid = None
+            try:
+                pid = (
+                    settings.get("index", {})
+                    .get("plugins", {})
+                    .get("index_state_management", {})
+                    .get("policy_id")
+                )
+            except AttributeError:
+                pid = None
+            if not pid:
+                pid = settings.get("index.plugins.index_state_management.policy_id")
+            ct_cache[entry.get("name")] = pid
+
+    rows = []
+    for entry in data.get("index_templates", []):
+        it = entry.get("index_template", {})
+        settings = it.get("template", {}).get("settings", {}) or {}
+        composed_of = it.get("composed_of", []) or []
+        # Inline policy id
+        inline_pid = None
+        try:
+            inline_pid = (
+                settings.get("index", {})
+                .get("plugins", {})
+                .get("index_state_management", {})
+                .get("policy_id")
+            )
+        except AttributeError:
+            inline_pid = None
+        if not inline_pid:
+            inline_pid = settings.get("index.plugins.index_state_management.policy_id")
+        # Inherited from composed_of (last-wins per OpenSearch merge semantics)
+        inherited_pid = None
+        inherited_from = None
+        for cname in composed_of:
+            cpid = ct_cache.get(cname)
+            if cpid:
+                inherited_pid = cpid
+                inherited_from = cname
+        effective = inline_pid or inherited_pid
+        rows.append({
+            "name": entry.get("name", "-"),
+            "index_patterns": ",".join(it.get("index_patterns", []) or []),
+            "policy_id": effective or "-",
+            "source": "inline" if inline_pid else (f"via {inherited_from}" if inherited_pid else "-"),
+            "composed_of": ",".join(composed_of) if composed_of else "-",
+        })
+    rows.sort(key=lambda r: r["name"])
+    return rows
+
+
+def print_index_templates(rows):
+    if isinstance(rows, dict) and "error" in rows:
+        print(json.dumps(rows, indent=2))
+        return
+    if not rows:
+        print("No index templates found")
+        return
+    _print_columns(rows, [
+        ("Name",         "name",           None),
+        ("Patterns",     "index_patterns", None),
+        ("Policy ID",    "policy_id",      None),
+        ("Source",       "source",         None),
+        ("Composed Of",  "composed_of",    None),
+    ])
+    print(f"\nTotal: {len(rows)} index template(s)")
+
+
+def set_index_template_policy(config, target=None, template_name=None, policy_id=None):
+    """PUT _index_template/<name> with index.plugins.index_state_management.policy_id
+    merged into template.settings. Preserves the rest of the template.
+
+    If policy_id == "none", removes the setting.
+    """
+    from .cli import get_server, get_auth, get_verify_ssl, get_cluster_base_url
+
+    if not template_name:
+        return {"error": "template_name is required"}
+    if not policy_id:
+        return {"error": "policy_id is required (use 'none' to remove)"}
+
+    server, _ = get_server(config, target)
+    base_url = get_cluster_base_url(server)
+    auth = get_auth(server)
+    verify_ssl = get_verify_ssl(server)
+
+    get_resp = requests.get(
+        f"{base_url}/_index_template/{template_name}", auth=auth, verify=verify_ssl,
+    )
+    if get_resp.status_code == 404:
+        return {"error": f"Index template '{template_name}' not found"}
+    if get_resp.status_code != 200:
+        return {"error": f"GET failed: HTTP {get_resp.status_code} - {get_resp.text}"}
+    payload = get_resp.json()
+    entries = payload.get("index_templates", [])
+    if not entries:
+        return {"error": f"Index template '{template_name}' returned empty"}
+    it = entries[0].get("index_template", {})
+    template = it.get("template", {}) or {}
+    settings = template.get("settings") or {}
+
+    if not isinstance(settings.get("index"), dict):
+        settings["index"] = {}
+    index_settings = settings["index"]
+    plugins_block = index_settings.setdefault("plugins", {})
+    ism_block = plugins_block.setdefault("index_state_management", {})
+    before = ism_block.get("policy_id")
+
+    if policy_id.lower() == "none":
+        ism_block.pop("policy_id", None)
+        if not ism_block:
+            plugins_block.pop("index_state_management", None)
+        if not plugins_block:
+            index_settings.pop("plugins", None)
+        after = None
+    else:
+        ism_block["policy_id"] = policy_id
+        after = policy_id
+
+    # Strip any stale dotted-form copy.
+    settings.pop("index.plugins.index_state_management.policy_id", None)
+
+    template["settings"] = settings
+    it["template"] = template
+
+    # Index template PUT body: pass through everything except readonly fields.
+    put_body = {k: v for k, v in it.items() if k not in ("version",)}
+    if "version" in it:
+        put_body["version"] = it["version"]
+
+    put_resp = requests.put(
+        f"{base_url}/_index_template/{template_name}",
+        headers={"Content-Type": "application/json"},
+        data=json.dumps(put_body),
+        auth=auth,
+        verify=verify_ssl,
+    )
+    try:
+        put_payload = put_resp.json()
+    except ValueError:
+        put_payload = {"raw": put_resp.text}
+
+    return {
+        "template": template_name,
+        "before": before,
+        "after": after,
+        "status": put_resp.status_code,
+        "ok": put_resp.status_code in (200, 201),
+        "response": put_payload,
+    }
+
+
+def print_set_index_template_result(result):
+    if isinstance(result, dict) and "error" in result and "status" not in result:
+        print(json.dumps(result, indent=2))
+        return
+    icon = "\033[92m✓\033[0m" if result.get("ok") else "\033[91m✗\033[0m"
+    print(f"  {icon} index-template={result['template']}  HTTP {result['status']}")
+    print(f"      policy_id: {result['before'] or '(unset)'} → {result['after'] or '(unset)'}")
+    if not result.get("ok"):
+        print(f"      response: {json.dumps(result.get('response'), indent=2)}")
+
+
+def list_component_templates(config, target=None, name_filter=None):
+    """List component templates: GET _component_template[/pattern].
+
+    Returns a list of dicts with name and whether they carry an ISM policy_id setting.
+    """
+    from .cli import get_server, get_auth, get_verify_ssl, get_cluster_base_url
+
+    server, _ = get_server(config, target)
+    base_url = get_cluster_base_url(server)
+    auth = get_auth(server)
+    verify_ssl = get_verify_ssl(server)
+
+    suffix = f"/{name_filter}" if name_filter else ""
+    resp = requests.get(f"{base_url}/_component_template{suffix}", auth=auth, verify=verify_ssl)
+    if resp.status_code != 200:
+        return {"error": f"HTTP {resp.status_code}: {resp.text}"}
+    data = resp.json()
+    rows = []
+    for entry in data.get("component_templates", []):
+        ct = entry.get("component_template", {})
+        settings = ct.get("template", {}).get("settings", {}) or {}
+        # ISM stamps the policy id at index.plugins.index_state_management.policy_id —
+        # accept either dotted or nested shape since OpenSearch normalises both.
+        flat = json.dumps(settings)
+        policy_id = None
+        try:
+            policy_id = (
+                settings.get("index", {})
+                .get("plugins", {})
+                .get("index_state_management", {})
+                .get("policy_id")
+            )
+        except AttributeError:
+            policy_id = None
+        if not policy_id and "policy_id" in flat:
+            # Could be the dotted form `index.plugins.index_state_management.policy_id`
+            policy_id = settings.get("index.plugins.index_state_management.policy_id")
+        rows.append({
+            "name": entry.get("name", "-"),
+            "policy_id": policy_id or "-",
+            "version": ct.get("version", "-"),
+        })
+    rows.sort(key=lambda r: r["name"])
+    return rows
+
+
+def print_component_templates(rows):
+    if isinstance(rows, dict) and "error" in rows:
+        print(json.dumps(rows, indent=2))
+        return
+    if not rows:
+        print("No component templates found")
+        return
+    _print_columns(rows, [
+        ("Name",      "name",      None),
+        ("Policy ID", "policy_id", None),
+        ("Version",   "version",   None),
+    ])
+    print(f"\nTotal: {len(rows)} component template(s)")
+
+
+def set_component_template_policy(config, target=None, template_name=None, policy_id=None):
+    """PUT _component_template/<name> with index.plugins.index_state_management.policy_id merged
+    into template.settings. Preserves the rest of the template (mappings, aliases, _meta, etc).
+
+    If policy_id == "none" the setting is REMOVED.
+    """
+    from .cli import get_server, get_auth, get_verify_ssl, get_cluster_base_url
+
+    if not template_name:
+        return {"error": "template_name is required"}
+    if not policy_id:
+        return {"error": "policy_id is required (use 'none' to remove)"}
+
+    server, _ = get_server(config, target)
+    base_url = get_cluster_base_url(server)
+    auth = get_auth(server)
+    verify_ssl = get_verify_ssl(server)
+
+    get_resp = requests.get(
+        f"{base_url}/_component_template/{template_name}", auth=auth, verify=verify_ssl,
+    )
+    if get_resp.status_code == 404:
+        return {"error": f"Component template '{template_name}' not found"}
+    if get_resp.status_code != 200:
+        return {"error": f"GET failed: HTTP {get_resp.status_code} - {get_resp.text}"}
+    payload = get_resp.json()
+    entries = payload.get("component_templates", [])
+    if not entries:
+        return {"error": f"Component template '{template_name}' returned empty"}
+    ct = entries[0].get("component_template", {})
+    template = ct.get("template", {}) or {}
+    settings = template.get("settings") or {}
+
+    # Normalise to nested form so we have a single place to set the value.
+    index_settings = settings.setdefault("index", {}) if isinstance(settings.get("index"), dict) else None
+    if index_settings is None:
+        # If 'index' was missing or not a dict, replace it.
+        settings["index"] = {}
+        index_settings = settings["index"]
+
+    plugins_block = index_settings.setdefault("plugins", {})
+    ism_block = plugins_block.setdefault("index_state_management", {})
+
+    before = ism_block.get("policy_id")
+
+    if policy_id.lower() == "none":
+        ism_block.pop("policy_id", None)
+        # Clean up empty parents we may have just created.
+        if not ism_block:
+            plugins_block.pop("index_state_management", None)
+        if not plugins_block:
+            index_settings.pop("plugins", None)
+        after = None
+    else:
+        ism_block["policy_id"] = policy_id
+        after = policy_id
+
+    # Also strip any stale dotted-form copy that may shadow our nested write.
+    settings.pop("index.plugins.index_state_management.policy_id", None)
+
+    template["settings"] = settings
+    ct["template"] = template
+    # Rebuild PUT body — OpenSearch's _component_template PUT takes the inner template object
+    # plus optional _meta and version at the top level.
+    put_body = {
+        "template": template,
+    }
+    if "_meta" in ct:
+        put_body["_meta"] = ct["_meta"]
+    if "version" in ct:
+        put_body["version"] = ct["version"]
+    if "allow_auto_create" in ct:
+        put_body["allow_auto_create"] = ct["allow_auto_create"]
+
+    put_resp = requests.put(
+        f"{base_url}/_component_template/{template_name}",
+        headers={"Content-Type": "application/json"},
+        data=json.dumps(put_body),
+        auth=auth,
+        verify=verify_ssl,
+    )
+    try:
+        put_payload = put_resp.json()
+    except ValueError:
+        put_payload = {"raw": put_resp.text}
+
+    return {
+        "template": template_name,
+        "before": before,
+        "after": after,
+        "status": put_resp.status_code,
+        "ok": put_resp.status_code in (200, 201),
+        "response": put_payload,
+    }
+
+
+def print_set_component_template_result(result):
+    if isinstance(result, dict) and "error" in result and "status" not in result:
+        print(json.dumps(result, indent=2))
+        return
+    icon = "\033[92m✓\033[0m" if result.get("ok") else "\033[91m✗\033[0m"
+    print(f"  {icon} component-template={result['template']}  HTTP {result['status']}")
+    print(f"      policy_id: {result['before'] or '(unset)'} → {result['after'] or '(unset)'}")
+    if not result.get("ok"):
+        print(f"      response: {json.dumps(result.get('response'), indent=2)}")
+
+
+def set_ism_rollover(config, target=None, policy_name=None, state_name="hot",
+                     min_index_age=None, min_size=None, min_doc_count=None,
+                     min_primary_shard_size=None):
+    """Edit the rollover action in an OpenSearch ISM policy state (default 'hot').
+
+    Each condition arg is one of:
+      - a string/int value to set/replace (e.g. "30d", "50gb", 150000000)
+      - the sentinel string "none" to REMOVE the condition
+      - None to leave the existing value untouched (additive merge)
+
+    Other fields in the rollover action (e.g. `copy_alias`) and the rest of the
+    policy are preserved. Uses optimistic concurrency control via if_seq_no /
+    if_primary_term, so concurrent edits to the same policy fail cleanly with
+    HTTP 409.
+    """
+    from .cli import get_server, get_auth, get_verify_ssl, get_cluster_base_url
+
+    if not policy_name:
+        return {"error": "policy_name is required"}
+
+    server, _ = get_server(config, target)
+    base_url = get_cluster_base_url(server)
+    auth = get_auth(server)
+    verify_ssl = get_verify_ssl(server)
+
+    # Fetch current policy with seq_no / primary_term for CAS update.
+    get_resp = requests.get(
+        f"{base_url}/_plugins/_ism/policies/{policy_name}",
+        auth=auth, verify=verify_ssl,
+    )
+    if get_resp.status_code == 404:
+        return {"error": f"Policy '{policy_name}' not found"}
+    if get_resp.status_code != 200:
+        return {"error": f"GET policy failed: HTTP {get_resp.status_code} - {get_resp.text}"}
+
+    doc = get_resp.json()
+    seq_no = doc.get("_seq_no")
+    primary_term = doc.get("_primary_term")
+    policy = doc.get("policy")
+    if not policy or not isinstance(policy, dict):
+        return {"error": "policy document missing 'policy' field"}
+
+    states = policy.get("states") or []
+    target_state = next((s for s in states if s.get("name") == state_name), None)
+    if target_state is None:
+        return {"error": f"state '{state_name}' not found in policy '{policy_name}'"}
+
+    # Find the action block containing a 'rollover' key.
+    rollover_action = None
+    for action in target_state.get("actions", []):
+        if isinstance(action, dict) and "rollover" in action:
+            rollover_action = action
+            break
+
+    if rollover_action is None:
+        return {
+            "error": (
+                f"state '{state_name}' has no rollover action; "
+                f"edit the policy manually to add one first"
+            )
+        }
+
+    rollover = rollover_action.get("rollover") or {}
+    if not isinstance(rollover, dict):
+        return {"error": "existing rollover field is not an object"}
+
+    before = dict(rollover)
+
+    # Apply changes. "none" sentinel removes; anything else sets.
+    def _apply(key, value):
+        if value is None:
+            return
+        if isinstance(value, str) and value.lower() == "none":
+            rollover.pop(key, None)
+        else:
+            rollover[key] = value
+
+    _apply("min_index_age", min_index_age)
+    _apply("min_size", min_size)
+    _apply("min_doc_count", int(min_doc_count) if min_doc_count not in (None, "none") else min_doc_count)
+    _apply("min_primary_shard_size", min_primary_shard_size)
+
+    rollover_action["rollover"] = rollover
+    after = dict(rollover)
+
+    # PUT the policy back. ISM requires {"policy": {...}} wrapper.
+    put_url = (
+        f"{base_url}/_plugins/_ism/policies/{policy_name}"
+        f"?if_seq_no={seq_no}&if_primary_term={primary_term}"
+    )
+    put_resp = requests.put(
+        put_url,
+        headers={"Content-Type": "application/json"},
+        data=json.dumps({"policy": policy}),
+        auth=auth,
+        verify=verify_ssl,
+    )
+
+    try:
+        put_payload = put_resp.json()
+    except ValueError:
+        put_payload = {"raw": put_resp.text}
+
+    return {
+        "policy": policy_name,
+        "state": state_name,
+        "before": before,
+        "after": after,
+        "status": put_resp.status_code,
+        "ok": put_resp.status_code in (200, 201),
+        "old_seq_no": seq_no,
+        "new_seq_no": put_payload.get("_seq_no") if isinstance(put_payload, dict) else None,
+        "response": put_payload,
+    }
+
+
+def print_set_rollover_result(result):
+    """Pretty-print the result of set_ism_rollover."""
+    if isinstance(result, dict) and "error" in result and "status" not in result:
+        print(json.dumps(result, indent=2))
+        return
+    icon = "\033[92m✓\033[0m" if result.get("ok") else "\033[91m✗\033[0m"
+    print(f"  {icon} policy={result['policy']} state={result['state']} "
+          f"HTTP {result['status']}  _seq_no {result['old_seq_no']} → {result.get('new_seq_no')}")
+    print(f"      before: {json.dumps(result['before'])}")
+    print(f"      after:  {json.dumps(result['after'])}")
+    if not result.get("ok"):
+        print(f"      response: {json.dumps(result.get('response'), indent=2)}")
+
+
+def set_ism_transition(config, target=None, policy_name=None,
+                       from_state=None, to_state=None,
+                       conditions=None, position="first"):
+    """Upsert a transition from `from_state` to `to_state` in an OpenSearch ISM policy.
+
+    `conditions` is a dict like {"min_size": "50gb"} or
+    {"min_rollover_age": "30d", "min_size": "50gb"}. Upsert is keyed by
+    (to_state, frozenset(conditions.keys())): an existing transition whose
+    conditions' key set matches exactly is updated in place; otherwise a new
+    transition is inserted at `position` ("first" or "last") in the
+    from_state's transitions list.
+
+    Pass "none" as a condition VALUE to drop that key. If the resulting
+    transition ends up with zero conditions, the transition itself is removed.
+
+    Rest of the policy is preserved. Uses optimistic concurrency control via
+    if_seq_no / if_primary_term, so concurrent edits to the same policy fail
+    cleanly with HTTP 409.
+    """
+    from .cli import get_server, get_auth, get_verify_ssl, get_cluster_base_url
+
+    if not policy_name:
+        return {"error": "policy_name is required"}
+    if not from_state or not to_state:
+        return {"error": "from_state and to_state are required"}
+    if not conditions or not isinstance(conditions, dict):
+        return {"error": "at least one condition is required"}
+    if position not in ("first", "last"):
+        return {"error": "position must be 'first' or 'last'"}
+
+    server, _ = get_server(config, target)
+    base_url = get_cluster_base_url(server)
+    auth = get_auth(server)
+    verify_ssl = get_verify_ssl(server)
+
+    get_resp = requests.get(
+        f"{base_url}/_plugins/_ism/policies/{policy_name}",
+        auth=auth, verify=verify_ssl,
+    )
+    if get_resp.status_code == 404:
+        return {"error": f"Policy '{policy_name}' not found"}
+    if get_resp.status_code != 200:
+        return {"error": f"GET policy failed: HTTP {get_resp.status_code} - {get_resp.text}"}
+
+    doc = get_resp.json()
+    seq_no = doc.get("_seq_no")
+    primary_term = doc.get("_primary_term")
+    policy = doc.get("policy")
+    if not policy or not isinstance(policy, dict):
+        return {"error": "policy document missing 'policy' field"}
+
+    states = policy.get("states") or []
+    src_state = next((s for s in states if s.get("name") == from_state), None)
+    if src_state is None:
+        return {"error": f"state '{from_state}' not found in policy '{policy_name}'"}
+
+    transitions = src_state.setdefault("transitions", [])
+
+    # Match existing transition by (to_state, exact set of condition keys).
+    requested_keys = frozenset(conditions.keys())
+    match_idx = None
+    for i, t in enumerate(transitions):
+        if not isinstance(t, dict) or t.get("state_name") != to_state:
+            continue
+        existing_keys = frozenset((t.get("conditions") or {}).keys())
+        if existing_keys == requested_keys:
+            match_idx = i
+            break
+
+    before_transitions = json.loads(json.dumps(transitions))
+    action = None
+
+    if match_idx is not None:
+        existing = transitions[match_idx]
+        existing_conds = dict(existing.get("conditions") or {})
+        for k, v in conditions.items():
+            if isinstance(v, str) and v.lower() == "none":
+                existing_conds.pop(k, None)
+            else:
+                existing_conds[k] = v
+        if not existing_conds:
+            transitions.pop(match_idx)
+            action = "removed"
+        else:
+            existing["conditions"] = existing_conds
+            action = "updated"
+    else:
+        new_conds = {
+            k: v for k, v in conditions.items()
+            if not (isinstance(v, str) and v.lower() == "none")
+        }
+        if not new_conds:
+            return {"error": "all conditions were 'none' and no matching transition exists to remove"}
+        new_transition = {"state_name": to_state, "conditions": new_conds}
+        if position == "first":
+            transitions.insert(0, new_transition)
+        else:
+            transitions.append(new_transition)
+        action = "inserted"
+
+    put_url = (
+        f"{base_url}/_plugins/_ism/policies/{policy_name}"
+        f"?if_seq_no={seq_no}&if_primary_term={primary_term}"
+    )
+    put_resp = requests.put(
+        put_url,
+        headers={"Content-Type": "application/json"},
+        data=json.dumps({"policy": policy}),
+        auth=auth,
+        verify=verify_ssl,
+    )
+
+    try:
+        put_payload = put_resp.json()
+    except ValueError:
+        put_payload = {"raw": put_resp.text}
+
+    return {
+        "policy": policy_name,
+        "from_state": from_state,
+        "to_state": to_state,
+        "action": action,
+        "before_transitions": before_transitions,
+        "after_transitions": transitions,
+        "status": put_resp.status_code,
+        "ok": put_resp.status_code in (200, 201),
+        "old_seq_no": seq_no,
+        "new_seq_no": put_payload.get("_seq_no") if isinstance(put_payload, dict) else None,
+        "response": put_payload,
+    }
+
+
+def print_set_transition_result(result):
+    """Pretty-print the result of set_ism_transition."""
+    if isinstance(result, dict) and "error" in result and "status" not in result:
+        print(json.dumps(result, indent=2))
+        return
+    icon = "\033[92m✓\033[0m" if result.get("ok") else "\033[91m✗\033[0m"
+    print(f"  {icon} policy={result['policy']} {result['from_state']} → {result['to_state']} "
+          f"[{result['action']}] HTTP {result['status']}  "
+          f"_seq_no {result['old_seq_no']} → {result.get('new_seq_no')}")
+    print(f"      before: {json.dumps(result['before_transitions'])}")
+    print(f"      after:  {json.dumps(result['after_transitions'])}")
+    if not result.get("ok"):
+        print(f"      response: {json.dumps(result.get('response'), indent=2)}")
+
+
+def edit_ism_template(config, target=None, policy_name=None,
+                      replace_patterns=None, add_patterns=None,
+                      remove_patterns=None, entry_index=0, priority=None):
+    """Edit the `ism_template` array of an OpenSearch ISM policy.
+
+    Operations are applied in this order on the same in-memory policy doc:
+      1. replace_patterns: list of (old, new) — for each pair, every
+         occurrence of `old` in any entry's index_patterns is replaced with
+         `new`. Idempotent: pairs whose `old` is not found are silently no-op.
+      2. remove_patterns: list of patterns — removed from every entry's
+         index_patterns. Entries left with empty index_patterns are dropped.
+      3. add_patterns: list of patterns — appended to the entry at
+         `entry_index` (post-remove state). Skipped if already present there.
+      4. priority: if not None, set on the entry at `entry_index`.
+
+    `last_updated_time` is bumped on every entry that actually changed.
+    Rest of the policy is preserved. CAS via if_seq_no / if_primary_term.
+    """
+    from .cli import get_server, get_auth, get_verify_ssl, get_cluster_base_url
+    import time
+
+    if not policy_name:
+        return {"error": "policy_name is required"}
+    replace_patterns = list(replace_patterns or [])
+    add_patterns = list(add_patterns or [])
+    remove_patterns = list(remove_patterns or [])
+    if not (replace_patterns or add_patterns or remove_patterns or priority is not None):
+        return {"error": "at least one of replace/add/remove/priority is required"}
+
+    server, _ = get_server(config, target)
+    base_url = get_cluster_base_url(server)
+    auth = get_auth(server)
+    verify_ssl = get_verify_ssl(server)
+
+    get_resp = requests.get(
+        f"{base_url}/_plugins/_ism/policies/{policy_name}",
+        auth=auth, verify=verify_ssl,
+    )
+    if get_resp.status_code == 404:
+        return {"error": f"Policy '{policy_name}' not found"}
+    if get_resp.status_code != 200:
+        return {"error": f"GET policy failed: HTTP {get_resp.status_code} - {get_resp.text}"}
+
+    doc = get_resp.json()
+    seq_no = doc.get("_seq_no")
+    primary_term = doc.get("_primary_term")
+    policy = doc.get("policy")
+    if not policy or not isinstance(policy, dict):
+        return {"error": "policy document missing 'policy' field"}
+
+    entries = policy.get("ism_template")
+    if entries is None:
+        entries = []
+        policy["ism_template"] = entries
+    if not isinstance(entries, list):
+        return {"error": "ism_template is not a list"}
+
+    before = json.loads(json.dumps(entries))
+    now_ms = int(time.time() * 1000)
+    changed_entries = set()
+
+    # 1. replace
+    for old, new in replace_patterns:
+        for i, entry in enumerate(entries):
+            pats = entry.get("index_patterns") or []
+            new_pats = [new if p == old else p for p in pats]
+            if new_pats != pats:
+                # dedupe while preserving order
+                seen = set()
+                deduped = []
+                for p in new_pats:
+                    if p not in seen:
+                        seen.add(p)
+                        deduped.append(p)
+                entry["index_patterns"] = deduped
+                changed_entries.add(i)
+
+    # 2. remove
+    if remove_patterns:
+        remove_set = set(remove_patterns)
+        for i, entry in enumerate(entries):
+            pats = entry.get("index_patterns") or []
+            new_pats = [p for p in pats if p not in remove_set]
+            if new_pats != pats:
+                entry["index_patterns"] = new_pats
+                changed_entries.add(i)
+        # drop entries with empty index_patterns (track which survive for entry_index remap)
+        surviving = []
+        dropped_before_index = 0
+        for i, entry in enumerate(entries):
+            if not entry.get("index_patterns"):
+                if i < entry_index:
+                    dropped_before_index += 1
+                continue
+            surviving.append(entry)
+        entries[:] = surviving
+        # remap entry_index against post-remove array
+        entry_index = max(0, entry_index - dropped_before_index)
+        # changed_entries indices referred to pre-remove positions; rebuild
+        # by checking what differs from `before` now (we'll just stamp time
+        # on indices that exist now AND differ).
+        changed_entries = {i for i, e in enumerate(entries) if i >= len(before) or e != before[i]}
+
+    # 3. add
+    if add_patterns:
+        if not entries:
+            entries.append({
+                "index_patterns": [],
+                "priority": 100,
+                "last_updated_time": now_ms,
+            })
+            entry_index = 0
+        if entry_index < 0 or entry_index >= len(entries):
+            return {"error": f"entry_index {entry_index} out of range (have {len(entries)} entries)"}
+        target_entry = entries[entry_index]
+        pats = list(target_entry.get("index_patterns") or [])
+        added = False
+        for p in add_patterns:
+            if p not in pats:
+                pats.append(p)
+                added = True
+        if added:
+            target_entry["index_patterns"] = pats
+            changed_entries.add(entry_index)
+
+    # 4. priority
+    if priority is not None:
+        if entry_index < 0 or entry_index >= len(entries):
+            return {"error": f"entry_index {entry_index} out of range (have {len(entries)} entries)"}
+        if entries[entry_index].get("priority") != priority:
+            entries[entry_index]["priority"] = priority
+            changed_entries.add(entry_index)
+
+    for i in changed_entries:
+        if 0 <= i < len(entries):
+            entries[i]["last_updated_time"] = now_ms
+
+    after = json.loads(json.dumps(entries))
+    if before == after:
+        return {
+            "policy": policy_name,
+            "before_ism_template": before,
+            "after_ism_template": after,
+            "status": 200,
+            "ok": True,
+            "old_seq_no": seq_no,
+            "new_seq_no": seq_no,
+            "no_op": True,
+            "response": {"message": "no changes"},
+        }
+
+    put_url = (
+        f"{base_url}/_plugins/_ism/policies/{policy_name}"
+        f"?if_seq_no={seq_no}&if_primary_term={primary_term}"
+    )
+    put_resp = requests.put(
+        put_url,
+        headers={"Content-Type": "application/json"},
+        data=json.dumps({"policy": policy}),
+        auth=auth,
+        verify=verify_ssl,
+    )
+
+    try:
+        put_payload = put_resp.json()
+    except ValueError:
+        put_payload = {"raw": put_resp.text}
+
+    return {
+        "policy": policy_name,
+        "before_ism_template": before,
+        "after_ism_template": after,
+        "status": put_resp.status_code,
+        "ok": put_resp.status_code in (200, 201),
+        "old_seq_no": seq_no,
+        "new_seq_no": put_payload.get("_seq_no") if isinstance(put_payload, dict) else None,
+        "no_op": False,
+        "response": put_payload,
+    }
+
+
+def print_edit_ism_template_result(result):
+    """Pretty-print the result of edit_ism_template."""
+    if isinstance(result, dict) and "error" in result and "status" not in result:
+        print(json.dumps(result, indent=2))
+        return
+    icon = "\033[92m✓\033[0m" if result.get("ok") else "\033[91m✗\033[0m"
+    tag = " [no-op]" if result.get("no_op") else ""
+    print(f"  {icon} policy={result['policy']}{tag} HTTP {result['status']}  "
+          f"_seq_no {result['old_seq_no']} → {result.get('new_seq_no')}")
+    print(f"      before: {json.dumps(result['before_ism_template'])}")
+    print(f"      after:  {json.dumps(result['after_ism_template'])}")
+    if not result.get("ok"):
+        print(f"      response: {json.dumps(result.get('response'), indent=2)}")
+
+
+def change_policy_for_indices(config, target=None, index_patterns=None, policy_id=None,
+                              state=None, include_states=None):
+    """Call POST _plugins/_ism/change_policy/<idx> for the given pattern(s).
+
+    Args:
+        index_patterns: list of concrete index names or wildcard patterns.
+        policy_id: ISM policy id to apply.
+        state: optional ISM state to start in (otherwise the policy's default_state).
+        include_states: optional list of current-state names; only indices currently in
+            one of these states will be affected (ISM 'include' filter). Pass None to
+            apply to all states.
+
+    Returns a list of result dicts.
+    """
+    from .cli import get_server, get_auth, get_verify_ssl, get_cluster_base_url
+
+    if not policy_id:
+        return {"error": "policy_id is required"}
+    if not index_patterns:
+        return {"error": "at least one index name or pattern is required"}
+
+    server, _ = get_server(config, target)
+    base_url = get_cluster_base_url(server)
+    auth = get_auth(server)
+    verify_ssl = get_verify_ssl(server)
+
+    body = {"policy_id": policy_id}
+    if state:
+        body["state"] = state
+    if include_states:
+        body["include"] = [{"state": s} for s in include_states]
+
+    # add endpoint takes only policy_id (no state / include)
+    add_body = {"policy_id": policy_id}
+
+    results = []
+    for pattern in index_patterns:
+        resp = requests.post(
+            f"{base_url}/_plugins/_ism/change_policy/{pattern}",
+            headers={"Content-Type": "application/json"},
+            data=json.dumps(body),
+            auth=auth,
+            verify=verify_ssl,
+        )
+        try:
+            payload = resp.json()
+        except ValueError:
+            payload = {"raw": resp.text}
+
+        # Fall back to _plugins/_ism/add for any indices reported as "not being managed".
+        # change_policy only operates on indices that already have an ISM managed-index doc;
+        # truly un-managed indices (no policy_id setting) need the add endpoint.
+        if isinstance(payload, dict):
+            unmanaged = [
+                f.get("index_name") for f in payload.get("failed_indices", [])
+                if isinstance(f, dict)
+                and "not being managed" in (f.get("reason") or "").lower()
+            ]
+        else:
+            unmanaged = []
+
+        add_failures = []
+        added_count = 0
+        for idx_name in unmanaged:
+            if not idx_name:
+                continue
+            add_resp = requests.post(
+                f"{base_url}/_plugins/_ism/add/{idx_name}",
+                headers={"Content-Type": "application/json"},
+                data=json.dumps(add_body),
+                auth=auth,
+                verify=verify_ssl,
+            )
+            try:
+                add_payload = add_resp.json()
+            except ValueError:
+                add_payload = {"raw": add_resp.text}
+            if isinstance(add_payload, dict):
+                added_count += int(add_payload.get("updated_indices") or 0)
+                for f in add_payload.get("failed_indices", []) or []:
+                    add_failures.append(f)
+
+        if unmanaged:
+            # Stitch the fallback outcome into the response so the printer reflects it.
+            if isinstance(payload, dict):
+                payload.setdefault("_fallback_add", {})
+                payload["_fallback_add"]["attempted"] = len(unmanaged)
+                payload["_fallback_add"]["added"] = added_count
+                payload["_fallback_add"]["failed"] = add_failures
+                # Remove the fallen-back failures from the primary failed list so they don't
+                # double-count, and append any genuine add-failures.
+                primary_failed = [
+                    f for f in payload.get("failed_indices", []) or []
+                    if isinstance(f, dict)
+                    and "not being managed" not in (f.get("reason") or "").lower()
+                ]
+                primary_failed.extend(add_failures)
+                payload["failed_indices"] = primary_failed
+                # Bump updated count to reflect successful adds.
+                payload["updated_indices"] = (
+                    int(payload.get("updated_indices") or 0) + added_count
+                )
+
+        results.append({
+            "pattern": pattern,
+            "status": resp.status_code,
+            "ok": resp.status_code in (200, 201),
+            "response": payload,
+        })
+    return results
+
+
+def retry_ism_for_indices(config, target=None, index_patterns=None, state=None):
+    """POST _plugins/_ism/retry/<idx> for each pattern.
+
+    state: if provided, ISM will retry from this state.
+    """
+    from .cli import get_server, get_auth, get_verify_ssl, get_cluster_base_url
+
+    if not index_patterns:
+        return {"error": "at least one index name or pattern is required"}
+
+    server, _ = get_server(config, target)
+    base_url = get_cluster_base_url(server)
+    auth = get_auth(server)
+    verify_ssl = get_verify_ssl(server)
+
+    body = {}
+    if state:
+        body["state"] = state
+
+    results = []
+    for pattern in index_patterns:
+        kwargs = dict(auth=auth, verify=verify_ssl,
+                      headers={"Content-Type": "application/json"})
+        if body:
+            kwargs["data"] = json.dumps(body)
+        resp = requests.post(f"{base_url}/_plugins/_ism/retry/{pattern}", **kwargs)
+        try:
+            payload = resp.json()
+        except ValueError:
+            payload = {"raw": resp.text}
+        results.append({
+            "pattern": pattern,
+            "status": resp.status_code,
+            "ok": resp.status_code in (200, 201),
+            "response": payload,
+        })
+    return results
+
+
+def rollover_index(config, target=None, name=None):
+    """Manually roll over a data stream or write alias.
+
+    name: data stream name (e.g. 'p2-staging-logs-app-apricot') or write alias.
+    """
+    from .cli import get_server, get_auth, get_verify_ssl, get_cluster_base_url
+
+    if not name:
+        return {"error": "data-stream or alias name is required"}
+
+    server, _ = get_server(config, target)
+    base_url = get_cluster_base_url(server)
+    auth = get_auth(server)
+    verify_ssl = get_verify_ssl(server)
+
+    resp = requests.post(f"{base_url}/{name}/_rollover", auth=auth, verify=verify_ssl)
+    try:
+        payload = resp.json()
+    except ValueError:
+        payload = {"raw": resp.text}
+    return {
+        "name": name,
+        "status": resp.status_code,
+        "ok": resp.status_code in (200, 201),
+        "response": payload,
+    }
+
+
+def list_data_streams(config, target=None, name_filter=None):
+    """List data streams: GET _data_stream[/pattern].
+
+    Returns a list of dicts with name, status, generation, write-index, backing-index count, template.
+    """
+    from .cli import get_server, get_auth, get_verify_ssl, get_cluster_base_url
+
+    server, _ = get_server(config, target)
+    base_url = get_cluster_base_url(server)
+    auth = get_auth(server)
+    verify_ssl = get_verify_ssl(server)
+
+    suffix = f"/{name_filter}" if name_filter else ""
+    resp = requests.get(f"{base_url}/_data_stream{suffix}", auth=auth, verify=verify_ssl)
+    if resp.status_code != 200:
+        return {"error": f"Failed to fetch data streams: {resp.status_code} - {resp.text}"}
+    data = resp.json()
+
+    rows = []
+    for ds in data.get("data_streams", []):
+        backing = ds.get("indices", [])
+        write_idx = backing[-1].get("index_name") if backing else "-"
+        rows.append({
+            "name": ds.get("name", "-"),
+            "status": ds.get("status", "-"),
+            "generation": ds.get("generation", "-"),
+            "backing_count": len(backing),
+            "write_index": write_idx,
+            "template": ds.get("template", "-"),
+        })
+    rows.sort(key=lambda r: r["name"])
+    return rows
+
+
+def print_data_streams(rows):
+    if isinstance(rows, dict) and "error" in rows:
+        print(json.dumps(rows, indent=2))
+        return
+    if not rows:
+        print("No data streams found")
+        return
+    _print_columns(rows, [
+        ("Name",       "name",          None),
+        ("Status",     "status",        None),
+        ("Gen",        "generation",    None),
+        ("Backing",    "backing_count", None),
+        ("Write Idx",  "write_index",   None),
+        ("Template",   "template",      None),
+    ])
+    print(f"\nTotal: {len(rows)} data stream(s)")
+
+
+def print_change_policy_results(results):
+    if isinstance(results, dict) and "error" in results:
+        print(json.dumps(results, indent=2))
+        return
+    for r in results:
+        icon = "\033[92m✓\033[0m" if r["ok"] else "\033[91m✗\033[0m"
+        resp = r.get("response") or {}
+        updated = resp.get("updated_indices", "-")
+        # ISM uses 'failed_indices' (list of {index_name, index_uuid, reason}).
+        # 'failures' is a boolean flag in the same response.
+        failed = resp.get("failed_indices") or []
+        # 'updated' may also be top-level for retry-style responses
+        if updated == "-":
+            updated = resp.get("updated", "-")
+        if failed:
+            detail = f"updated={updated} failed={len(failed)}"
+        else:
+            detail = f"updated={updated}"
+        print(f"  {icon} {r['pattern']:55s} HTTP {r['status']}  {detail}")
+        for f in failed:
+            name = f.get("index_name") or f.get("index") or "?"
+            reason = f.get("reason") or "(no reason)"
+            print(f"      \033[91m✗\033[0m {name}: {reason}")
+
+
+def print_policy_status(results, show_errors=True):
+    if not results:
+        print("No indices match the filter")
+        return
+    columns = [
+        ("Index",   "index",       None),
+        ("Policy",  "policy",      None),
+        ("Phase",   "phase",       None),
+        ("Action",  "action",      None),
+        ("Step",    "step",        "step_status"),
+        ("Status",  "step_status", "step_status"),
+        ("Retries", "retries",     None),
+        ("In Step", "time_in_step",None),
+    ]
+    _print_columns(results, columns)
+
+    if show_errors:
+        problem_rows = [r for r in results if r["step_status"] in ("failed", "retrying") and r.get("error")]
+        if problem_rows:
+            print("\nErrors:")
+            for r in problem_rows:
+                print(f"  \033[91m✗\033[0m {r['index']} [{r['step']}] {r['error']}")
+
+    counts = {}
+    for r in results:
+        counts[r["step_status"]] = counts.get(r["step_status"], 0) + 1
+    summary = ", ".join(f"{v} {k}" for k, v in sorted(counts.items()))
+    print(f"\nTotal: {len(results)} index(es) — {summary}")
