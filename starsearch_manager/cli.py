@@ -359,8 +359,10 @@ def main():
         print("  starsearch-cli ilm <policy> set cold-after <days>       - Set cold phase for a policy")
         print("  starsearch-cli ilm <policy> set rollover <size> <docs>  - Set rollover thresholds")
         print("  starsearch-cli index delete <index-name>                - Delete an index")
+        print("  starsearch-cli index field-caps <pattern> [--non-keyword] [--conflicts] [--unknown] [--json] - Inspect field types across a pattern (flags '?'/unknown & conflict fields as shown in OSD)")
         print("  starsearch-cli index-pattern list                       - List all index patterns")
         print("  starsearch-cli index-pattern delete <pattern-id>        - Delete an index pattern")
+        print("  starsearch-cli index-pattern refresh <pattern-id> [--dry-run] - Refresh a pattern's cached field list from the live mapping (OSD 'Refresh field list')")
         sys.exit(0 if len(sys.argv) > 1 else 1)
 
     target = None
@@ -982,6 +984,22 @@ def main():
         print(json.dumps(result, indent=2))
         return
 
+    if len(args) >= 3 and args[0] == "index" and args[1] == "field-caps":
+        pattern = next((a for a in args[2:] if not a.startswith("-")), None)
+        if not pattern:
+            print("Usage: starsearch-cli index field-caps <pattern> [--non-keyword] [--conflicts] [--unknown] [--json]")
+            sys.exit(1)
+        result = functions.get_field_caps(
+            cfg, pattern, target,
+            only_non_keyword="--non-keyword" in args,
+            only_conflicts="--conflicts" in args,
+            only_unknown="--unknown" in args,
+        )
+        if "--json" in args:
+            print(json.dumps(result, indent=2))
+            sys.exit(0 if "error" not in result else 1)
+        sys.exit(functions.print_field_caps(result))
+
     # Index pattern commands
     if len(args) >= 2 and args[0] == "index-pattern":
         if args[1] == "list":
@@ -999,6 +1017,17 @@ def main():
             result = functions.delete_index_pattern(cfg, pattern_id, target)
             print(json.dumps(result, indent=2))
             return
+        elif args[1] == "refresh":
+            pattern_id = next((a for a in args[2:] if not a.startswith("-")), None)
+            if not pattern_id:
+                print("Usage: starsearch-cli index-pattern refresh <pattern-id> [--dry-run] [--json]")
+                sys.exit(1)
+            apply = "--dry-run" not in args
+            result = functions.refresh_index_pattern(cfg, pattern_id, target, apply=apply)
+            if "--json" in args:
+                print(json.dumps(result, indent=2))
+                sys.exit(0 if "error" not in result else 1)
+            sys.exit(functions.print_refresh_index_pattern(result))
 
     # Fallback to endpoint query
     endpoint = resolve_endpoint(args)

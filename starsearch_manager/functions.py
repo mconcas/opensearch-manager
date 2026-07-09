@@ -317,6 +317,396 @@ def delete_index(config, index_name, target=None):
         return {"error": delete_resp.text}
 
 
+# ES/OpenSearch field types that OpenSearch Dashboards renders with a proper
+# type icon. Anything NOT in this set shows the generic "?" (unknown) icon in
+# the index-pattern field list — those are the ones the user is usually hunting.
+KNOWN_OSD_FIELD_TYPES = {
+    # string family
+    "text", "keyword", "wildcard", "constant_keyword", "match_only_text",
+    "version", "string", "search_as_you_type",
+    # number family
+    "long", "integer", "short", "byte", "double", "float", "half_float",
+    "scaled_float", "unsigned_long", "token_count",
+    # date
+    "date", "date_nanos",
+    # misc recognised
+    "boolean", "ip", "geo_point", "geo_shape",
+    "object", "nested", "histogram", "murmur3", "attachment",
+    # metadata fields
+    "_source", "_id", "_index", "_type",
+}
+
+# Field types that OSD treats as string-like (icon renders as text/string).
+STRING_LIKE_FIELD_TYPES = {
+    "text", "keyword", "wildcard", "constant_keyword", "match_only_text",
+    "version", "string", "search_as_you_type",
+}
+
+
+def get_field_caps(config, pattern, target=None,
+                   only_non_keyword=False, only_conflicts=False,
+                   only_unknown=False):
+    """Inspect field types across an index pattern via the _field_caps API.
+
+    Maps to what OpenSearch Dashboards shows in the index-pattern field list:
+      - a field with a type NOT in KNOWN_OSD_FIELD_TYPES renders as "?" (unknown)
+      - a field mapped as more than one type across matching indices is a conflict
+
+    Filters (applied to the reported set):
+      only_non_keyword - drop fields whose type is string-like (keyword/text/...)
+      only_conflicts   - keep only fields with >1 type across indices
+      only_unknown     - keep only fields OSD would render with the "?" icon
+    """
+    from .cli import get_server, get_auth, get_verify_ssl, get_cluster_base_url
+
+    server, _ = get_server(config, target)
+    base_url = get_cluster_base_url(server)
+    auth = get_auth(server)
+    verify_ssl = get_verify_ssl(server)
+
+    resp = requests.get(
+        f"{base_url}/{pattern}/_field_caps",
+        params={"fields": "*"},
+        auth=auth, verify=verify_ssl,
+    )
+
+    if resp.status_code == 404:
+        return {"error": f"No indices match pattern '{pattern}'"}
+    if resp.status_code != 200:
+        return {"error": resp.text}
+
+    data = resp.json()
+    raw_fields = data.get("fields", {})
+
+    fields = []
+    for name, type_map in sorted(raw_fields.items()):
+        types = sorted(type_map.keys())
+        is_conflict = len(types) > 1
+        # Internal metadata fields (type/name starting with "_", e.g. _seq_no,
+        # _version, _field_names) aren't shown in OSD's field list at all, so
+        # don't flag them as the user-facing "?" icon.
+        is_metadata = name.startswith("_") or all(t.startswith("_") for t in types)
+        is_unknown = (not is_metadata) and any(
+            t not in KNOWN_OSD_FIELD_TYPES for t in types
+        )
+        is_string_like = all(t in STRING_LIKE_FIELD_TYPES for t in types)
+
+        # Aggregatable / searchable are reported per-type; collapse to "any".
+        aggregatable = any(spec.get("aggregatable") for spec in type_map.values())
+        searchable = any(spec.get("searchable") for spec in type_map.values())
+
+        entry = {
+            "field": name,
+            "types": types,
+            "conflict": is_conflict,
+            "unknown": is_unknown,
+            "string_like": is_string_like,
+            "aggregatable": aggregatable,
+            "searchable": searchable,
+        }
+        if is_conflict:
+            # surface which indices carry which type, if provided
+            entry["indices_by_type"] = {
+                t: spec.get("indices")
+                for t, spec in type_map.items() if spec.get("indices")
+            }
+
+        if only_conflicts and not is_conflict:
+            continue
+        if only_unknown and not is_unknown:
+            continue
+        if only_non_keyword and is_string_like:
+            continue
+        fields.append(entry)
+
+    return {
+        "pattern": pattern,
+        "indices": data.get("indices", []),
+        "total_fields": len(raw_fields),
+        "reported_fields": len(fields),
+        "fields": fields,
+    }
+
+
+def print_field_caps(result):
+    """Pretty-print get_field_caps output. Returns an exit code."""
+    if "error" in result:
+        print(json.dumps(result, indent=2))
+        return 1
+
+    red = STATUS_COLORS.get("failed", "")
+    reset = COLORS["reset"]
+    yellow = COLORS["warm"]
+
+    print(f"\nPattern: {result['pattern']}")
+    print(f"Matching indices: {len(result['indices'])}")
+    print(f"Fields: {result['reported_fields']} shown / {result['total_fields']} total")
+    print("=" * 80)
+
+    if not result["fields"]:
+        print("(no fields match the given filters)")
+        return 0
+
+    for f in result["fields"]:
+        flags = []
+        if f["unknown"]:
+            flags.append(f"{yellow}?unknown{reset}")
+        if f["conflict"]:
+            flags.append(f"{red}CONFLICT{reset}")
+        flag_str = ("  [" + " ".join(flags) + "]") if flags else ""
+        types_str = ",".join(f["types"])
+        agg = "" if f["aggregatable"] else " (not aggregatable)"
+        print(f"  {f['field']:<50} {types_str}{agg}{flag_str}")
+        if f.get("indices_by_type"):
+            for t, idxs in f["indices_by_type"].items():
+                shown = ", ".join(idxs[:3]) + (" ..." if len(idxs) > 3 else "")
+                print(f"      {t}: {shown}")
+
+    print("=" * 80)
+    n_unknown = sum(1 for f in result["fields"] if f["unknown"])
+    n_conflict = sum(1 for f in result["fields"] if f["conflict"])
+    print(f"{n_unknown} field(s) render as '?' (unknown type), {n_conflict} conflict(s)")
+    return 0
+
+
+# ES type -> OpenSearch Dashboards field type, mirroring OSD's
+# castEsToKbnFieldTypeName(). Anything unmapped becomes "unknown", and a field
+# whose indices disagree on the kbn type is collapsed to "conflict" (same as the
+# OSD field list).
+_ES_TO_KBN_TYPE = {
+    "text": "string", "keyword": "string", "string": "string",
+    "match_only_text": "string", "constant_keyword": "string",
+    "wildcard": "string", "version": "string", "search_as_you_type": "string",
+    "date": "date", "date_nanos": "date",
+    "boolean": "boolean",
+    "byte": "number", "double": "number", "float": "number",
+    "half_float": "number", "integer": "number", "long": "number",
+    "scaled_float": "number", "short": "number", "unsigned_long": "number",
+    "token_count": "number",
+    "geo_point": "geo_point", "geo_shape": "geo_shape",
+    "ip": "ip", "attachment": "attachment", "murmur3": "murmur3",
+    "nested": "nested", "object": "object", "histogram": "histogram",
+    "_source": "_source", "_id": "string", "_index": "string", "_type": "string",
+}
+
+
+def _kbn_type(es_type):
+    return _ES_TO_KBN_TYPE.get(es_type, "unknown")
+
+
+def _should_read_from_doc_values(aggregatable, es_type):
+    # Mirror of OSD's shouldReadFieldFromDocValues().
+    return (
+        aggregatable
+        and es_type != "text"
+        and not es_type.startswith("_")
+        and es_type not in ("geo_shape", "flattened")
+    )
+
+
+def _build_index_pattern_fields(field_caps_fields):
+    """Rebuild the OSD index-pattern 'fields' list from a _field_caps response.
+
+    Replicates the shape OSD's _fields_for_wildcard produces so the refreshed
+    saved object is byte-compatible with what the "Refresh field list" button
+    writes: type/esTypes, searchable, aggregatable, readFromDocValues, and
+    subType.multi.parent for multi-fields (e.g. jwt.username.keyword).
+    """
+    # Primary es type per field, so we can classify parents for multi-fields.
+    primary_es_type = {}
+    for name, type_map in field_caps_fields.items():
+        types = sorted(type_map.keys())
+        primary_es_type[name] = types[0] if types else None
+
+    fields = []
+    for name in sorted(field_caps_fields.keys()):
+        type_map = field_caps_fields[name]
+        es_types = sorted(type_map.keys())
+        kbn_types = {_kbn_type(t) for t in es_types}
+
+        aggregatable = any(spec.get("aggregatable") for spec in type_map.values())
+        searchable = any(spec.get("searchable") for spec in type_map.values())
+
+        if len(kbn_types) > 1:
+            kbn_type = "conflict"
+        else:
+            kbn_type = next(iter(kbn_types))
+
+        entry = {
+            "count": 0,
+            "name": name,
+            "type": kbn_type,
+            "esTypes": es_types,
+            "scripted": False,
+            "searchable": searchable,
+            "aggregatable": aggregatable,
+            "readFromDocValues": _should_read_from_doc_values(
+                aggregatable, es_types[0]
+            ),
+        }
+
+        # Multi-field detection: a dotted field whose parent is a leaf (not an
+        # object/nested) is a multi-field, e.g. jwt.username.keyword under the
+        # text field jwt.username. Parents that are objects (jwt) are plain
+        # nested paths, not multi-fields.
+        if "." in name:
+            parent = name.rsplit(".", 1)[0]
+            parent_es = primary_es_type.get(parent)
+            if parent_es is not None and parent_es not in ("object", "nested"):
+                entry["subType"] = {"multi": {"parent": parent}}
+
+        fields.append(entry)
+
+    return fields
+
+
+def refresh_index_pattern(config, pattern_id, target=None, apply=False):
+    """Refresh an index pattern's cached field list from the live mapping.
+
+    This is the CLI equivalent of the OSD "Refresh field list" button: OSD keeps
+    a cached copy of the mapping's fields inside the index-pattern saved object
+    (in .kibana), and that cache goes stale when new fields are added to the
+    mapping after the pattern was last refreshed. Aggregations/Controls read the
+    cached list, so newly-mapped fields (and their .keyword sub-fields) won't
+    appear until the cache is refreshed.
+
+    With apply=False (default) nothing is written: the added/removed field diff
+    is returned so the caller can review before mutating .kibana.
+    """
+    from .cli import (get_server, get_auth, get_verify_ssl, get_base_url,
+                      get_cluster_base_url, use_dashboards_api)
+
+    server, _ = get_server(config, target)
+    auth = get_auth(server)
+    verify_ssl = get_verify_ssl(server)
+    cluster_url = get_cluster_base_url(server)
+
+    if use_dashboards_api(server):
+        return {"error": "refresh via Dashboards API not implemented; this "
+                         "target uses direct .kibana access only"}
+
+    base_url = get_base_url(server)
+    doc_url = f"{base_url}/.kibana/_doc/index-pattern:{pattern_id}"
+
+    resp = requests.get(doc_url, auth=auth, verify=verify_ssl)
+    if resp.status_code == 404:
+        return {"error": f"Index pattern '{pattern_id}' not found in .kibana"}
+    if resp.status_code != 200:
+        return {"error": resp.text}
+
+    doc = resp.json()
+    source = doc["_source"]
+    ip = source.get("index-pattern", {})
+    title = ip.get("title")
+    if not title:
+        return {"error": f"Saved object index-pattern:{pattern_id} has no title"}
+
+    try:
+        old_fields = json.loads(ip.get("fields", "[]"))
+    except (ValueError, TypeError):
+        old_fields = []
+    old_by_name = {f["name"]: f for f in old_fields}
+
+    # Live field capabilities for the pattern's title.
+    fc = requests.get(
+        f"{cluster_url}/{title}/_field_caps",
+        params={"fields": "*"}, auth=auth, verify=verify_ssl,
+    )
+    if fc.status_code == 404:
+        return {"error": f"No indices match pattern title '{title}'"}
+    if fc.status_code != 200:
+        return {"error": fc.text}
+    raw_fields = fc.json().get("fields", {})
+
+    fresh_regular = _build_index_pattern_fields(
+        {n: tm for n, tm in raw_fields.items() if not n.startswith("_")}
+    )
+
+    # Preserve meta fields (_source/_id/_index/_score ...) and any scripted
+    # fields from the existing cache — OSD keeps these across a refresh and some
+    # (e.g. _score) don't appear in _field_caps at all.
+    preserved = [f for f in old_fields
+                 if f["name"].startswith("_") or f.get("scripted")]
+    preserved_names = {f["name"] for f in preserved}
+    fresh_regular = [f for f in fresh_regular if f["name"] not in preserved_names]
+
+    # Carry over popularity counts for fields that already existed.
+    for f in fresh_regular:
+        old = old_by_name.get(f["name"])
+        if old and old.get("count"):
+            f["count"] = old["count"]
+
+    new_fields = preserved + fresh_regular
+    new_fields.sort(key=lambda f: f["name"])
+
+    old_names = set(old_by_name.keys())
+    new_names = {f["name"] for f in new_fields}
+    added = sorted(new_names - old_names)
+    removed = sorted(old_names - new_names)
+
+    result = {
+        "pattern_id": pattern_id,
+        "title": title,
+        "old_field_count": len(old_fields),
+        "new_field_count": len(new_fields),
+        "added": added,
+        "removed": removed,
+        "applied": False,
+    }
+
+    if not apply:
+        result["dry_run"] = True
+        return result
+
+    # Write the refreshed field list back, preserving all other attributes.
+    ip["fields"] = json.dumps(new_fields)
+    source["index-pattern"] = ip
+    put = requests.put(
+        doc_url, json=source, auth=auth, verify=verify_ssl,
+        headers={"Content-Type": "application/json"},
+    )
+    if put.status_code not in (200, 201):
+        result["error"] = put.text
+        return result
+    result["applied"] = True
+    return result
+
+
+def print_refresh_index_pattern(result):
+    """Pretty-print refresh_index_pattern output. Returns an exit code."""
+    if "error" in result:
+        print(json.dumps(result, indent=2))
+        return 1
+
+    green = STATUS_COLORS.get("completed", "")
+    red = STATUS_COLORS.get("failed", "")
+    reset = COLORS["reset"]
+
+    mode = "DRY-RUN (no changes written)" if result.get("dry_run") else \
+           ("APPLIED" if result.get("applied") else "NOT APPLIED")
+    print(f"\nIndex pattern: {result['pattern_id']}  ({result['title']})")
+    print(f"Mode: {mode}")
+    print(f"Cached fields: {result['old_field_count']} -> {result['new_field_count']}")
+    print("=" * 80)
+
+    added, removed = result["added"], result["removed"]
+    if added:
+        print(f"{green}+ {len(added)} field(s) to be added:{reset}")
+        for name in added:
+            print(f"    + {name}")
+    if removed:
+        print(f"{red}- {len(removed)} field(s) to be removed:{reset}")
+        for name in removed:
+            print(f"    - {name}")
+    if not added and not removed:
+        print("Cache already matches the live mapping — nothing to refresh.")
+    print("=" * 80)
+
+    if result.get("dry_run"):
+        print("Re-run without --dry-run to write the refreshed field list to .kibana.")
+    return 0
+
+
 def delete_index_pattern(config, pattern_id, target=None):
     """Delete an index pattern from .kibana or Dashboards API."""
     from .cli import get_server, get_auth, get_verify_ssl, get_base_url, use_dashboards_api
