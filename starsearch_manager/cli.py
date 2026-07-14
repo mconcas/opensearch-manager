@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import glob
 import json
 import sys
 from pathlib import Path
@@ -8,84 +9,132 @@ from . import functions
 
 VERSION = "0.1.0"
 
+# Sentinel for --global: force the global saved-object scope, overriding any
+# per-target dashboards.workspace default.
+FORCE_GLOBAL = "__global__"
+
 def load_config():
     config_path = Path.home() / ".starsearch" / "config.json"
     with open(config_path) as f:
         return json.load(f)
 
 def get_server(config, target=None):
-    """Get server configuration by name or return the default (first) server.
+    """Get a target by name, or the default (first) target.
+
+    A target bundles the OpenSearch/OS cluster endpoint and the OpenSearch
+    Dashboards (OSD) endpoint under one name, with credentials shared at the
+    target level. See the README for the schema.
 
     Args:
-        config: Configuration dictionary containing 'servers' list
-        target: Optional server name to look up
+        config: Configuration dictionary containing a 'targets' list
+        target: Optional target name to look up
 
     Returns:
-        tuple: (server_dict, is_default_bool)
+        tuple: (target_dict, is_default_bool)
 
     Raises:
-        SystemExit: If target server is not found (prints available servers and exits)
+        SystemExit: If the config is missing/legacy, or the target is not found.
     """
-    servers = config["servers"]
-    if target:
-        for srv in servers:
-            if srv["name"] == target:
-                return srv, False
-
-        # Target not found - show helpful error message
-        print(f"Error: Server '{target}' not found in configuration", file=sys.stderr)
-        print(f"\nAvailable servers:", file=sys.stderr)
-        for srv in servers:
-            print(f"  - {srv['name']}", file=sys.stderr)
+    targets = config.get("targets")
+    if not targets:
+        if config.get("servers"):
+            print("Error: config uses the old flat 'servers' format. It is no "
+                  "longer supported.\nMigrate to the 'targets' schema (a target "
+                  "bundles 'cluster' and 'dashboards' endpoints); see the README.",
+                  file=sys.stderr)
+        else:
+            print("Error: no 'targets' configured in ~/.starsearch/config.json",
+                  file=sys.stderr)
         sys.exit(1)
 
-    return servers[0], True  # default server, is_default=True
+    if target:
+        for tgt in targets:
+            if tgt["name"] == target:
+                return tgt, False
 
-def get_auth(server):
-    """Get auth tuple from server config if username/password are present."""
-    username = server.get("username")
-    password = server.get("password")
+        # Target not found - show helpful error message
+        print(f"Error: target '{target}' not found in configuration", file=sys.stderr)
+        print("\nAvailable targets:", file=sys.stderr)
+        for tgt in targets:
+            print(f"  - {tgt['name']}", file=sys.stderr)
+        sys.exit(1)
+
+    return targets[0], True  # default target, is_default=True
+
+def get_auth(target):
+    """Get auth tuple from target-level username/password (shared by both endpoints)."""
+    username = target.get("username")
+    password = target.get("password")
     if username and password:
         return (username, password)
     return None
 
-def get_verify_ssl(server):
-    """Get SSL verification setting from server config (default True)."""
-    return server.get("verify_ssl", True)
+def get_verify_ssl(target):
+    """Get SSL verification setting from the target (default True)."""
+    return target.get("verify_ssl", True)
 
-def get_cluster_base_url(server):
-    """Construct base URL for OpenSearch/Elasticsearch cluster API access."""
-    protocol = server['protocol']
-    host = server['host']
-    cluster_path = server.get('cluster_path', '')
+def _endpoint(target, kind):
+    """Return the 'cluster' or 'dashboards' endpoint sub-object, or exit with a clear error."""
+    ep = target.get(kind)
+    if not isinstance(ep, dict):
+        print(f"Error: target '{target.get('name', '?')}' has no '{kind}' endpoint "
+              f"configured in ~/.starsearch/config.json", file=sys.stderr)
+        sys.exit(1)
+    return ep
 
-    if cluster_path:
-        # Ensure cluster_path starts with / and doesn't end with /
-        if not cluster_path.startswith('/'):
-            cluster_path = '/' + cluster_path
-        if cluster_path.endswith('/'):
-            cluster_path = cluster_path[:-1]
-        return f"{protocol}://{host}{cluster_path}"
-    return f"{protocol}://{host}"
+def _build_url(endpoint):
+    """Build {protocol}://{host}{path} for an endpoint dict, normalizing an optional path prefix."""
+    protocol = endpoint['protocol']
+    host = endpoint['host']
+    path = endpoint.get('path', '')
+    if path:
+        if not path.startswith('/'):
+            path = '/' + path
+        if path.endswith('/'):
+            path = path[:-1]
+    return f"{protocol}://{host}{path}"
 
-def get_base_url(server):
-    """Construct base URL from server config including optional base_path (for Dashboards API)."""
-    protocol = server['protocol']
-    host = server['host']
-    base_path = server.get('base_path', '')
+def get_cluster_base_url(target):
+    """Base URL for OpenSearch/Elasticsearch cluster API access (target's 'cluster' endpoint)."""
+    return _build_url(_endpoint(target, 'cluster'))
 
-    if base_path:
-        # Ensure base_path starts with / and doesn't end with /
-        if not base_path.startswith('/'):
-            base_path = '/' + base_path
-        if base_path.endswith('/'):
-            base_path = base_path[:-1]
-        return f"{protocol}://{host}{base_path}"
-    return f"{protocol}://{host}"
+def get_base_url(target):
+    """Base URL for the OpenSearch Dashboards API (target's 'dashboards' endpoint)."""
+    return _build_url(_endpoint(target, 'dashboards'))
 
-def use_dashboards_api(server):
-    """Check if we should use OpenSearch Dashboards API (true when base_path is set)."""
-    return bool(server.get('base_path'))
+def use_dashboards_api(target):
+    """True when the target defines a 'dashboards' endpoint (otherwise Dashboards ops are unavailable)."""
+    return isinstance(target.get('dashboards'), dict)
+
+def get_workspace(target, workspace=None):
+    """Resolve the OSD workspace id.
+
+    Precedence: an explicit --workspace value wins; FORCE_GLOBAL (--global)
+    forces the global scope (None); otherwise fall back to the target's
+    dashboards.workspace default.
+    """
+    if workspace == FORCE_GLOBAL:
+        return None
+    if workspace:
+        return workspace
+    dashboards = target.get('dashboards')
+    if isinstance(dashboards, dict):
+        return dashboards.get('workspace')
+    return None
+
+def get_dashboards_base_url(target, workspace=None):
+    """Base URL for Dashboards saved-objects API, prefixed with /w/<id> when a workspace is set.
+
+    In workspace-enabled OpenSearch Dashboards, saved objects are scoped to a
+    workspace via a `/w/<workspace_id>/` URL segment. Without it, requests hit
+    the global scope. This does NOT apply to raw `.kibana` index operations —
+    use get_base_url(target) for those.
+    """
+    base = get_base_url(target)
+    ws = get_workspace(target, workspace)
+    if ws:
+        return f"{base}/w/{ws}"
+    return base
 
 def load_commands():
     commands_path = Path(__file__).parent / "commands.yaml"
@@ -193,7 +242,7 @@ def print_validation_results(result, verbose=False):
         return 1
     return 0
 
-def handle_saved_object_command(args, cfg, target, obj_type):
+def handle_saved_object_command(args, cfg, target, obj_type, workspace=None):
     """Generic handler for saved object commands (list/export/import/delete)."""
     if len(args) < 2:
         return False
@@ -202,7 +251,7 @@ def handle_saved_object_command(args, cfg, target, obj_type):
 
     if subcommand == "list":
         # Use appropriate list function based on type
-        results = functions.list_dashboards(cfg, target, obj_type=obj_type)
+        results = functions.list_dashboards(cfg, target, obj_type=obj_type, workspace=workspace)
 
         if isinstance(results, dict) and "error" in results:
             print(json.dumps(results, indent=2))
@@ -250,20 +299,54 @@ def handle_saved_object_command(args, cfg, target, obj_type):
                 i += 1
 
         obj_ids = filtered_args if filtered_args else None
-        result = functions.export_saved_objects(cfg, target, obj_ids, obj_type=type_filter)
+        result = functions.export_saved_objects(cfg, target, obj_ids, obj_type=type_filter, workspace=workspace)
         handle_export_output(result, use_json, to_file, output_dir)
         return True
 
     elif subcommand == "import":
         if len(args) < 3:
             obj_name = obj_type or "saved-object"
-            print(f"Usage: starsearch-cli {obj_name} import <file.ndjson>")
+            print(f"Usage: starsearch-cli {obj_name} import <file.ndjson> [file2.ndjson ...]")
             sys.exit(1)
-        filepath = args[2]
-        with open(filepath, 'r') as f:
-            ndjson_content = f.read()
-        result = functions.import_saved_objects(cfg, ndjson_content, target, obj_type=obj_type)
-        print(json.dumps(result, indent=2))
+
+        # Expand each argument as a glob pattern so callers can pass wildcards
+        # (e.g. "*.ndjson") even when the shell doesn't expand them — quoted
+        # patterns, no-match under noglob, etc. A pattern with no matches falls
+        # back to the literal argument so a genuinely missing file still errors.
+        patterns = args[2:]
+        filepaths = []
+        seen = set()
+        for pattern in patterns:
+            matches = sorted(glob.glob(pattern))
+            if not matches:
+                matches = [pattern]
+            for match in matches:
+                if match not in seen:
+                    seen.add(match)
+                    filepaths.append(match)
+
+        results = {}
+        exit_code = 0
+        for filepath in filepaths:
+            try:
+                with open(filepath, 'r') as f:
+                    ndjson_content = f.read()
+            except OSError as e:
+                results[filepath] = {"error": str(e)}
+                exit_code = 1
+                continue
+            result = functions.import_saved_objects(cfg, ndjson_content, target, obj_type=obj_type, workspace=workspace)
+            results[filepath] = result
+            if isinstance(result, dict) and (result.get("error") or result.get("errors")):
+                exit_code = 1
+
+        # Preserve the single-file output shape when only one file was imported.
+        if len(filepaths) == 1:
+            print(json.dumps(results[filepaths[0]], indent=2))
+        else:
+            print(json.dumps(results, indent=2))
+        if exit_code:
+            sys.exit(exit_code)
         return True
 
     elif subcommand == "delete":
@@ -273,7 +356,7 @@ def handle_saved_object_command(args, cfg, target, obj_type):
             print(f"Usage: starsearch-cli {obj_type} delete <id>")
             sys.exit(1)
         obj_id = args[2]
-        result = functions.delete_saved_object(cfg, obj_id, obj_type, target)
+        result = functions.delete_saved_object(cfg, obj_id, obj_type, target, workspace=workspace)
         print(json.dumps(result, indent=2))
         return True
 
@@ -304,29 +387,33 @@ def main():
     if len(sys.argv) < 2 or sys.argv[1] in ["-h", "--help"]:
         print("Usage: starsearch-cli <command> [args] or starsearch-cli <endpoint>")
         print("       starsearch-cli -t|--target <name> <command> [args]")
+        print("       starsearch-cli -w|--workspace <id> <command> [args]  (scope OSD saved objects to a workspace)")
+        print("       starsearch-cli --global <command> [args]              (force global scope, ignoring the target's workspace default)")
         print("       starsearch-cli -v|--version")
         print("\nTarget Management:")
         print("  starsearch-cli target list                              - List all configured targets/servers")
+        print("\nWorkspace Management:")
+        print("  starsearch-cli workspace list [--json]                  - List OSD workspaces (id, name) on the target")
         print("\nObject Management:")
         print("  starsearch-cli saved-object list                        - List all saved objects")
         print("  starsearch-cli saved-object export [id1 id2 ...] [--json] [--type <type>] - Export saved objects")
         print("    --type <type>   Filter by type: visualization, dashboard, or search")
-        print("  starsearch-cli saved-object import <file.ndjson>        - Import saved objects from ndjson")
+        print("  starsearch-cli saved-object import <file.ndjson> ...    - Import saved objects (accepts multiple files / wildcards)")
         print("")
         print("  starsearch-cli dashboard list                           - List all dashboards")
         print("  starsearch-cli dashboard export [id1 id2 ...] [--json]  - Export dashboards to ndjson")
-        print("  starsearch-cli dashboard import <file.ndjson>           - Import dashboards from ndjson")
+        print("  starsearch-cli dashboard import <file.ndjson> ...       - Import dashboards (accepts multiple files / wildcards)")
         print("  starsearch-cli dashboard delete <id>                    - Delete a dashboard")
         print("  starsearch-cli dashboard validate [id ...] [--verbose] [--json] - Validate dashboards")
         print("")
         print("  starsearch-cli visualization list                       - List all visualizations")
         print("  starsearch-cli visualization export [id1 id2 ...] [--json] - Export visualizations to ndjson")
-        print("  starsearch-cli visualization import <file.ndjson>       - Import visualizations from ndjson")
+        print("  starsearch-cli visualization import <file.ndjson> ...   - Import visualizations (accepts multiple files / wildcards)")
         print("  starsearch-cli visualization delete <id>                - Delete a visualization")
         print("")
         print("  starsearch-cli search list                              - List all saved searches")
         print("  starsearch-cli search export [id1 id2 ...] [--json]     - Export searches to ndjson")
-        print("  starsearch-cli search import <file.ndjson>              - Import searches from ndjson")
+        print("  starsearch-cli search import <file.ndjson> ...          - Import searches (accepts multiple files / wildcards)")
         print("  starsearch-cli search delete <id>                       - Delete a search")
         print("")
         print("  starsearch-cli detector list                            - List all anomaly detection detectors")
@@ -366,44 +453,79 @@ def main():
         sys.exit(0 if len(sys.argv) > 1 else 1)
 
     target = None
+    workspace = None
     args = sys.argv[1:]
 
-    if args[0] in ["-t", "--target"]:
-        if len(args) < 3:
-            print("Error: -t/--target requires a server name")
-            sys.exit(1)
-        target = args[1]
-        args = args[2:]
+    # Consume leading global flags (-t/--target, -w/--workspace, --global) in any order.
+    while args and args[0] in ["-t", "--target", "-w", "--workspace", "--global"]:
+        if args[0] in ["-t", "--target"]:
+            if len(args) < 2:
+                print("Error: -t/--target requires a server name")
+                sys.exit(1)
+            target = args[1]
+            args = args[2:]
+        elif args[0] == "--global":
+            # Force the global scope, ignoring any per-target workspace default.
+            workspace = FORCE_GLOBAL
+            args = args[1:]
+        else:
+            if len(args) < 2:
+                print("Error: -w/--workspace requires a workspace id")
+                sys.exit(1)
+            workspace = args[1]
+            args = args[2:]
+
+    if not args:
+        print("Error: no command given")
+        sys.exit(1)
 
     cfg = load_config()
 
     # Target commands
     if len(args) >= 2 and args[0] == "target" and args[1] == "list":
-        servers = cfg.get("servers", [])
-        if not servers:
+        targets = cfg.get("targets", [])
+        if not targets:
             print("No targets configured in ~/.starsearch/config.json")
             return
 
+        def _fmt_endpoint(ep):
+            if not isinstance(ep, dict):
+                return "(not configured)"
+            return f"{ep.get('protocol', '?')}://{ep.get('host', '?')}{ep.get('path', '')}"
+
         print("\nConfigured targets:")
         print("="*80)
-        for i, srv in enumerate(servers):
+        for i, tgt in enumerate(targets):
             is_default = " (default)" if i == 0 else ""
-            print(f"\n{srv['name']}{is_default}")
-            print(f"  URL: {srv['protocol']}://{srv['host']}")
-            if srv.get('username'):
-                print(f"  Auth: {srv['username']}")
-            if srv.get('cluster_path'):
-                print(f"  Cluster Path: {srv['cluster_path']}")
-            if srv.get('base_path'):
-                print(f"  Base Path: {srv['base_path']}")
-            print(f"  SSL Verify: {srv.get('verify_ssl', True)}")
+            print(f"\n{tgt['name']}{is_default}")
+            if tgt.get('username'):
+                print(f"  Auth: {tgt['username']}")
+            print(f"  SSL Verify: {tgt.get('verify_ssl', True)}")
+            print(f"  Cluster:    {_fmt_endpoint(tgt.get('cluster'))}")
+            dash = tgt.get('dashboards')
+            print(f"  Dashboards: {_fmt_endpoint(dash)}")
+            if isinstance(dash, dict) and dash.get('workspace'):
+                print(f"    Workspace: {dash['workspace']}")
         print("\n" + "="*80)
-        print(f"\nTotal: {len(servers)} target(s)")
+        print(f"\nTotal: {len(targets)} target(s)")
+        return
+
+    # Workspace commands (inspect remote OSD workspaces)
+    if len(args) >= 2 and args[0] == "workspace" and args[1] == "list":
+        use_json = "--json" in args
+        results = functions.list_workspaces(cfg, target)
+        if isinstance(results, dict) and "error" in results:
+            print(json.dumps(results, indent=2))
+            sys.exit(1)
+        if use_json:
+            print(json.dumps(results, indent=2))
+        else:
+            functions.print_workspaces(results)
         return
 
     # Saved-object commands (type-agnostic)
     if len(args) >= 2 and args[0] == "saved-object":
-        if handle_saved_object_command(args, cfg, target, obj_type=None):
+        if handle_saved_object_command(args, cfg, target, obj_type=None, workspace=workspace):
             return
 
     # Dashboard commands
@@ -413,7 +535,7 @@ def main():
             use_json_flag = "--json" in args
             # Collect dashboard IDs (everything that's not a flag)
             d_ids = [a for a in args[2:] if not a.startswith("-")]
-            result = functions.validate_dashboards(cfg, target, d_ids or None, verbose=verbose)
+            result = functions.validate_dashboards(cfg, target, d_ids or None, verbose=verbose, workspace=workspace)
             if use_json_flag:
                 print(json.dumps(result, indent=2))
             else:
@@ -421,17 +543,17 @@ def main():
                 if exit_code:
                     sys.exit(exit_code)
             return
-        if handle_saved_object_command(args, cfg, target, obj_type="dashboard"):
+        if handle_saved_object_command(args, cfg, target, obj_type="dashboard", workspace=workspace):
             return
 
     # Visualization commands
     if len(args) >= 2 and args[0] == "visualization":
-        if handle_saved_object_command(args, cfg, target, obj_type="visualization"):
+        if handle_saved_object_command(args, cfg, target, obj_type="visualization", workspace=workspace):
             return
 
     # Search commands
     if len(args) >= 2 and args[0] == "search":
-        if handle_saved_object_command(args, cfg, target, obj_type="search"):
+        if handle_saved_object_command(args, cfg, target, obj_type="search", workspace=workspace):
             return
 
     # Detector commands

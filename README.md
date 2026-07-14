@@ -25,25 +25,25 @@ pip install -e .
 
 ## Configuration
 
-Create `~/.starsearch/config.json` with your cluster details:
+Create `~/.starsearch/config.json`. A **target** bundles the OpenSearch/ES
+**cluster** endpoint and the OpenSearch Dashboards (**OSD**) endpoint under one
+name, with credentials shared across both:
 
 ```json
 {
-  "servers": [
+  "targets": [
     {
-      "name": "local-es",
-      "host": "localhost:9200",
-      "protocol": "http"
+      "name": "local",
+      "cluster": { "protocol": "http", "host": "localhost:9200" },
+      "dashboards": { "protocol": "http", "host": "localhost:5601" }
     },
     {
-      "name": "prod-os",
-      "host": "opensearch.example.com",
-      "protocol": "https",
+      "name": "prod",
       "username": "admin",
       "password": "your-password",
       "verify_ssl": false,
-      "cluster_path": "/os",
-      "base_path": "/dashboards"
+      "cluster":    { "protocol": "https", "host": "opensearch.example.com", "path": "/os" },
+      "dashboards": { "protocol": "https", "host": "opensearch.example.com", "path": "/dashboards", "workspace": "9gt3vk" }
     }
   ]
 }
@@ -51,26 +51,65 @@ Create `~/.starsearch/config.json` with your cluster details:
 
 ### Configuration Options
 
-- `name`: Identifier for the server (used with `--target`)
-- `host`: Server hostname and port
-- `protocol`: `http` or `https`
+Target-level (shared by both endpoints):
+
+- `name`: Identifier for the target (used with `-t`/`--target`)
 - `username`/`password`: Basic authentication credentials (optional)
-- `verify_ssl`: Set to `false` to disable SSL certificate verification (optional)
-- `cluster_path`: Path prefix for cluster API access, e.g., `/os` (optional)
-- `base_path`: Path prefix for Dashboards API access, e.g., `/dashboards` (optional)
+- `verify_ssl`: Set to `false` to disable SSL certificate verification (optional, default `true`)
+
+Endpoint-level, under `cluster` (ES/OS cluster API) and `dashboards` (OSD API):
+
+- `protocol`: `http` or `https`
+- `host`: Hostname and port (e.g. `localhost:9200`, `localhost:5601`)
+- `path`: Optional reverse-proxy path prefix, e.g. `/os` or `/dashboards`
+- `workspace` (`dashboards` only): Default OSD workspace id to scope saved objects to (optional)
+
+A target may define only `cluster` or only `dashboards`; commands that need the
+missing endpoint will report a clear error. The default target is the first in
+the list.
 
 ## Usage
 
+### Workspaces
+
+If your OpenSearch Dashboards instance uses **workspaces**, saved objects
+(dashboards, visualizations, searches) are scoped per workspace. Any command
+that touches saved objects — `list`, `export`, `import`, `delete`, `validate` —
+can be pointed at a workspace, either via the target's `dashboards.workspace`
+config default or the global `-w`/`--workspace <id>` flag (which overrides it).
+Use `--global` to force the global scope even when a default workspace is set:
+
+```bash
+# Discover workspace ids on the target
+starsearch-cli -t prod workspace list
+
+# List / export / import into a specific workspace
+starsearch-cli -w 9gt3vk dashboard list
+starsearch-cli -t prod -w 9gt3vk dashboard import dashboards.ndjson
+
+# Inspect the global (workspace-less) scope, ignoring the config default
+starsearch-cli --global dashboard list
+```
+
+`workspace list` queries the Dashboards `/api/workspaces/_list` API and prints
+each workspace's id and name (add `--json` for raw output). The workspace id is
+also the short token in the OSD URL (`/w/<id>/app/...`).
+
+> **Note:** In the **global** scope (no workspace resolved), objects are not
+> associated with any workspace and won't appear inside one. `import` uses the
+> Dashboards `_import` API, the only path that actually tags objects with the
+> target workspace.
+
 ### Target Management
 
-View all configured servers/targets:
+View all configured targets:
 
 ```bash
 # List all available targets
 starsearch-cli target list
 ```
 
-This shows all configured servers with their connection details, including which one is the default.
+This shows each target's cluster and dashboards endpoints, including which one is the default.
 
 ### Basic Queries
 

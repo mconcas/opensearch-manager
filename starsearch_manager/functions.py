@@ -573,7 +573,7 @@ def refresh_index_pattern(config, pattern_id, target=None, apply=False):
     With apply=False (default) nothing is written: the added/removed field diff
     is returned so the caller can review before mutating .kibana.
     """
-    from .cli import (get_server, get_auth, get_verify_ssl, get_base_url,
+    from .cli import (get_server, get_auth, get_verify_ssl,
                       get_cluster_base_url, use_dashboards_api)
 
     server, _ = get_server(config, target)
@@ -585,8 +585,8 @@ def refresh_index_pattern(config, pattern_id, target=None, apply=False):
         return {"error": "refresh via Dashboards API not implemented; this "
                          "target uses direct .kibana access only"}
 
-    base_url = get_base_url(server)
-    doc_url = f"{base_url}/.kibana/_doc/index-pattern:{pattern_id}"
+    # .kibana is a cluster index — use the cluster endpoint, not dashboards.
+    doc_url = f"{cluster_url}/.kibana/_doc/index-pattern:{pattern_id}"
 
     resp = requests.get(doc_url, auth=auth, verify=verify_ssl)
     if resp.status_code == 404:
@@ -709,20 +709,21 @@ def print_refresh_index_pattern(result):
 
 def delete_index_pattern(config, pattern_id, target=None):
     """Delete an index pattern from .kibana or Dashboards API."""
-    from .cli import get_server, get_auth, get_verify_ssl, get_base_url, use_dashboards_api
+    from .cli import get_server, get_auth, get_verify_ssl, get_base_url, get_cluster_base_url, use_dashboards_api
 
     server, _ = get_server(config, target)
-    base_url = get_base_url(server)
     auth = get_auth(server)
     verify_ssl = get_verify_ssl(server)
 
     if use_dashboards_api(server):
         # Use OpenSearch Dashboards API (requires osd-xsrf header for DELETE)
+        base_url = get_base_url(server)
         headers = {'osd-xsrf': 'true'}
         delete_resp = requests.delete(f"{base_url}/api/saved_objects/index-pattern/{pattern_id}", auth=auth, verify=verify_ssl, headers=headers)
     else:
-        # Use direct .kibana index access
-        delete_resp = requests.delete(f"{base_url}/.kibana/_doc/index-pattern:{pattern_id}", auth=auth, verify=verify_ssl)
+        # Use direct .kibana index access (cluster index, not the Dashboards endpoint)
+        cluster_url = get_cluster_base_url(server)
+        delete_resp = requests.delete(f"{cluster_url}/.kibana/_doc/index-pattern:{pattern_id}", auth=auth, verify=verify_ssl)
 
     if delete_resp.status_code == 200:
         return {
@@ -907,21 +908,81 @@ def print_table(results):
         print("  ".join(row))
 
 
-def list_dashboards(config, target=None, obj_type=None):
-    """List saved objects (dashboards, visualizations, searches) from .kibana or Dashboards API."""
+def list_workspaces(config, target=None):
+    """List OpenSearch Dashboards workspaces on the target (id, name, description).
+
+    Uses the Dashboards `POST /api/workspaces/_list` API, which is global (not
+    itself workspace-scoped). Requires the target to have a 'dashboards' endpoint.
+    """
     from .cli import get_server, get_auth, get_verify_ssl, get_base_url, use_dashboards_api
 
     server, _ = get_server(config, target)
+    if not use_dashboards_api(server):
+        return {"error": "Workspaces require a 'dashboards' endpoint in the target config"}
+
     base_url = get_base_url(server)
     auth = get_auth(server)
     verify_ssl = get_verify_ssl(server)
 
+    resp = requests.post(
+        f"{base_url}/api/workspaces/_list",
+        headers={"osd-xsrf": "true", "Content-Type": "application/json"},
+        json={},
+        auth=auth,
+        verify=verify_ssl,
+    )
+    if resp.status_code != 200:
+        return {"error": f"Failed to list workspaces: HTTP {resp.status_code}: {resp.text}"}
+
+    try:
+        body = resp.json()
+    except ValueError:
+        return {"error": f"Unexpected response: {resp.text}"}
+
+    # Response shape: {"success": true, "result": {"workspaces": [...]}} across OSD versions;
+    # tolerate a bare list under `result` too.
+    result = body.get("result", body)
+    workspaces = result.get("workspaces", result) if isinstance(result, dict) else result
+    if not isinstance(workspaces, list):
+        return {"error": f"Unexpected response: {json.dumps(body)}"}
+
+    return [
+        {
+            "id": ws.get("id"),
+            "name": ws.get("name"),
+            "description": ws.get("description", ""),
+        }
+        for ws in workspaces
+    ]
+
+
+def print_workspaces(results):
+    """Pretty-print the workspace list from list_workspaces()."""
+    if not results:
+        print("No workspaces found.")
+        return
+    print(f"\n{'ID':<24} {'NAME':<30} DESCRIPTION")
+    print("=" * 90)
+    for ws in results:
+        print(f"{(ws.get('id') or ''):<24} {(ws.get('name') or ''):<30} {ws.get('description') or ''}")
+    print(f"\nTotal: {len(results)} workspace(s)")
+
+
+def list_dashboards(config, target=None, obj_type=None, workspace=None):
+    """List saved objects (dashboards, visualizations, searches) from .kibana or Dashboards API."""
+    from .cli import get_server, get_auth, get_verify_ssl, get_cluster_base_url, get_dashboards_base_url, use_dashboards_api
+
+    server, _ = get_server(config, target)
+    auth = get_auth(server)
+    verify_ssl = get_verify_ssl(server)
+
     if use_dashboards_api(server):
-        # Use OpenSearch Dashboards API
+        # Use OpenSearch Dashboards API (workspace-scoped when a workspace is set)
+        api_base = get_dashboards_base_url(server, workspace)
         if obj_type:
-            url = f"{base_url}/api/saved_objects/_find?type={obj_type}&per_page=1000"
+            url = f"{api_base}/api/saved_objects/_find?type={obj_type}&per_page=1000"
         else:
-            url = f"{base_url}/api/saved_objects/_find?type=dashboard&type=visualization&type=search&per_page=1000"
+            url = f"{api_base}/api/saved_objects/_find?type=dashboard&type=visualization&type=search&per_page=1000"
 
         resp = requests.get(url, auth=auth, verify=verify_ssl)
         if resp.status_code != 200:
@@ -942,8 +1003,9 @@ def list_dashboards(config, target=None, obj_type=None):
                 'title': title
             })
     else:
-        # Use direct .kibana index access
-        url = f"{base_url}/.kibana/_search?size=1000"
+        # Use direct .kibana index access (cluster index, not the Dashboards endpoint)
+        cluster_url = get_cluster_base_url(server)
+        url = f"{cluster_url}/.kibana/_search?size=1000"
         resp = requests.get(url, auth=auth, verify=verify_ssl)
         if resp.status_code != 200:
             return {"error": f"Failed to fetch saved objects: {resp.status_code}"}
@@ -977,17 +1039,31 @@ def list_dashboards(config, target=None, obj_type=None):
     return results
 
 
+def _count_cached_fields(fields):
+    """Return the number of cached fields in an index-pattern's 'fields' attribute.
+
+    OSD stores the cached field list as a JSON-encoded string. Returns 0 when it
+    is missing/empty and None when it can't be parsed (shown as 'n/a').
+    """
+    if not fields:
+        return 0
+    try:
+        return len(json.loads(fields))
+    except (ValueError, TypeError):
+        return None
+
+
 def list_index_patterns(config, target=None):
     """List all index patterns from .kibana index or Dashboards API."""
-    from .cli import get_server, get_auth, get_verify_ssl, get_base_url, use_dashboards_api
+    from .cli import get_server, get_auth, get_verify_ssl, get_base_url, get_cluster_base_url, use_dashboards_api
 
     server, _ = get_server(config, target)
-    base_url = get_base_url(server)
     auth = get_auth(server)
     verify_ssl = get_verify_ssl(server)
 
     if use_dashboards_api(server):
         # Use OpenSearch Dashboards API
+        base_url = get_base_url(server)
         url = f"{base_url}/api/saved_objects/_find?type=index-pattern&per_page=1000"
         resp = requests.get(url, auth=auth, verify=verify_ssl)
         if resp.status_code != 200:
@@ -1000,14 +1076,21 @@ def list_index_patterns(config, target=None):
             pattern_id = obj['id']
             attrs = obj.get('attributes', {})
             title = attrs.get('title', 'N/A')
+            # Workspace scoping: prefer OSD 'workspaces', fall back to 'namespaces'.
+            workspaces = obj.get('workspaces') or obj.get('namespaces') or []
 
             results.append({
                 'id': pattern_id,
-                'title': title
+                'title': title,
+                'time_field': attrs.get('timeFieldName') or '',
+                'workspaces': workspaces,
+                'updated_at': obj.get('updated_at') or '',
+                'cached_fields': _count_cached_fields(attrs.get('fields')),
             })
     else:
-        # Use direct .kibana index access (Elasticsearch/OpenSearch)
-        url = f"{base_url}/.kibana/_search?size=1000"
+        # Use direct .kibana index access (cluster index, not the Dashboards endpoint)
+        cluster_url = get_cluster_base_url(server)
+        url = f"{cluster_url}/.kibana/_search?size=1000"
         resp = requests.get(url, auth=auth, verify=verify_ssl)
         if resp.status_code != 200:
             return {"error": f"Failed to fetch saved objects: {resp.status_code}"}
@@ -1028,16 +1111,23 @@ def list_index_patterns(config, target=None):
             # Remove type prefix if present
             if ':' in obj_id:
                 obj_id = obj_id.split(':', 1)[1]
+            # Direct .kibana docs carry a single 'namespace' string.
+            namespace = source.get('namespace')
+            workspaces = [namespace] if namespace else []
 
             results.append({
                 'id': obj_id,
-                'title': title
+                'title': title,
+                'time_field': obj_data.get('timeFieldName') or '',
+                'workspaces': workspaces,
+                'updated_at': source.get('updated_at') or '',
+                'cached_fields': _count_cached_fields(obj_data.get('fields')),
             })
 
     return results
 
 
-def delete_saved_object(config, obj_id, obj_type, target=None):
+def delete_saved_object(config, obj_id, obj_type, target=None, workspace=None):
     """Delete a saved object (dashboard, visualization, or search) from .kibana or Dashboards API.
 
     Args:
@@ -1045,18 +1135,20 @@ def delete_saved_object(config, obj_id, obj_type, target=None):
         obj_id: ID of the object to delete
         obj_type: Type of object - "dashboard", "visualization", or "search"
         target: Optional server name
+        workspace: Optional OSD workspace id to scope the deletion to
     """
-    from .cli import get_server, get_auth, get_verify_ssl, get_base_url, use_dashboards_api
+    from .cli import get_server, get_auth, get_verify_ssl, get_cluster_base_url, get_dashboards_base_url, use_dashboards_api
 
     server, _ = get_server(config, target)
-    base_url = get_base_url(server)
     auth = get_auth(server)
     verify_ssl = get_verify_ssl(server)
 
     if use_dashboards_api(server):
-        # Use OpenSearch Dashboards API (requires osd-xsrf header for DELETE)
+        # Use OpenSearch Dashboards API (requires osd-xsrf header for DELETE),
+        # workspace-scoped when a workspace is set.
+        api_base = get_dashboards_base_url(server, workspace)
         headers = {'osd-xsrf': 'true'}
-        delete_resp = requests.delete(f"{base_url}/api/saved_objects/{obj_type}/{obj_id}", auth=auth, verify=verify_ssl, headers=headers)
+        delete_resp = requests.delete(f"{api_base}/api/saved_objects/{obj_type}/{obj_id}", auth=auth, verify=verify_ssl, headers=headers)
         if delete_resp.status_code == 200:
             return {
                 "success": True,
@@ -1069,9 +1161,10 @@ def delete_saved_object(config, obj_id, obj_type, target=None):
         else:
             return {"error": delete_resp.text}
     else:
-        # Use direct .kibana index access
+        # Use direct .kibana index access (cluster index, not the Dashboards endpoint)
+        cluster_url = get_cluster_base_url(server)
         # Try with type prefix first
-        delete_resp = requests.delete(f"{base_url}/.kibana/_doc/{obj_type}:{obj_id}", auth=auth, verify=verify_ssl)
+        delete_resp = requests.delete(f"{cluster_url}/.kibana/_doc/{obj_type}:{obj_id}", auth=auth, verify=verify_ssl)
 
         if delete_resp.status_code == 200:
             return {
@@ -1082,7 +1175,7 @@ def delete_saved_object(config, obj_id, obj_type, target=None):
             }
         elif delete_resp.status_code == 404:
             # Try without prefix
-            delete_resp = requests.delete(f"{base_url}/.kibana/_doc/{obj_id}", auth=auth, verify=verify_ssl)
+            delete_resp = requests.delete(f"{cluster_url}/.kibana/_doc/{obj_id}", auth=auth, verify=verify_ssl)
             if delete_resp.status_code == 200:
                 return {
                     "success": True,
@@ -1122,20 +1215,38 @@ def print_saved_objects(results):
         for r in results:
             print(f"{r['type'].ljust(type_width)}  {r['id'].ljust(id_width)}  {r['title'].ljust(title_width)}")
     else:
-        # Calculate column widths for index patterns (no type field)
-        id_width = max(len(r['id']) for r in results) if results else 2
-        id_width = max(id_width, len('ID'))
-        title_width = max(len(r['title']) for r in results) if results else 5
-        title_width = max(title_width, len('Title'))
+        # Index patterns: show the richer attributes when available, falling back
+        # to the plain ID/Title view for older-shaped results.
+        def _cached(r):
+            n = r.get('cached_fields')
+            return 'n/a' if n is None else str(n)
 
-        # Print header
-        header = f"{'ID'.ljust(id_width)}  {'Title'.ljust(title_width)}"
+        def _workspaces(r):
+            return ', '.join(r.get('workspaces') or []) or '-'
+
+        def _updated(r):
+            # Trim the ISO timestamp to minute precision for a compact column.
+            return (r.get('updated_at') or '').replace('T', ' ')[:16]
+
+        columns = [
+            ('ID', lambda r: r['id']),
+            ('Title', lambda r: r['title']),
+            ('Time Field', lambda r: r.get('time_field') or '-'),
+            ('Workspaces', _workspaces),
+            ('Fields', _cached),
+            ('Updated', _updated),
+        ]
+
+        widths = []
+        for name, getter in columns:
+            widths.append(max([len(name)] + [len(getter(r)) for r in results]))
+
+        header = "  ".join(name.ljust(w) for (name, _), w in zip(columns, widths))
         print(header)
         print("-" * len(header))
 
-        # Print rows
         for r in results:
-            print(f"{r['id'].ljust(id_width)}  {r['title'].ljust(title_width)}")
+            print("  ".join(getter(r).ljust(w) for (_, getter), w in zip(columns, widths)))
 
 
 def list_detectors(config, target=None):
@@ -1289,12 +1400,11 @@ def export_detectors(config, target=None, detector_ids=None):
     return '\n'.join(ndjson_lines) if ndjson_lines else ''
 
 
-def export_saved_objects(config, target=None, obj_ids=None, obj_type=None):
+def export_saved_objects(config, target=None, obj_ids=None, obj_type=None, workspace=None):
     """Export saved objects (dashboards/visualizations/searches) to ndjson format with index-pattern mapping."""
-    from .cli import get_server, get_auth, get_verify_ssl, get_base_url, use_dashboards_api
+    from .cli import get_server, get_auth, get_verify_ssl, get_cluster_base_url, get_dashboards_base_url, use_dashboards_api
 
     server, _ = get_server(config, target)
-    base_url = get_base_url(server)
     auth = get_auth(server)
     verify_ssl = get_verify_ssl(server)
 
@@ -1302,8 +1412,9 @@ def export_saved_objects(config, target=None, obj_ids=None, obj_type=None):
     ndjson_lines = []
 
     if use_dashboards_api(server):
-        # Use OpenSearch Dashboards API
-        ip_resp = requests.get(f"{base_url}/api/saved_objects/_find?type=index-pattern&per_page=1000", auth=auth, verify=verify_ssl)
+        # Use OpenSearch Dashboards API (workspace-scoped when a workspace is set)
+        api_base = get_dashboards_base_url(server, workspace)
+        ip_resp = requests.get(f"{api_base}/api/saved_objects/_find?type=index-pattern&per_page=1000", auth=auth, verify=verify_ssl)
         if ip_resp.status_code != 200:
             return {"error": f"Failed to fetch index patterns: {ip_resp.status_code}"}
 
@@ -1315,7 +1426,7 @@ def export_saved_objects(config, target=None, obj_ids=None, obj_type=None):
             if title:
                 index_pattern_map[obj_id] = title
 
-        url = f"{base_url}/api/saved_objects/_find?type=dashboard&type=visualization&type=search&per_page=1000"
+        url = f"{api_base}/api/saved_objects/_find?type=dashboard&type=visualization&type=search&per_page=1000"
         resp = requests.get(url, auth=auth, verify=verify_ssl)
         if resp.status_code != 200:
             return {"error": f"Failed to fetch saved objects: {resp.status_code}"}
@@ -1359,8 +1470,9 @@ def export_saved_objects(config, target=None, obj_ids=None, obj_type=None):
 
             ndjson_lines.append(json.dumps(export_obj))
     else:
-        # Use direct .kibana index access
-        resp = requests.get(f"{base_url}/.kibana/_search?size=1000", auth=auth, verify=verify_ssl)
+        # Use direct .kibana index access (cluster index, not the Dashboards endpoint)
+        cluster_url = get_cluster_base_url(server)
+        resp = requests.get(f"{cluster_url}/.kibana/_search?size=1000", auth=auth, verify=verify_ssl)
         if resp.status_code != 200:
             return {"error": f"Failed to fetch saved objects: {resp.status_code}"}
 
@@ -1591,7 +1703,7 @@ def _resolve_ip_for_object(obj, index_patterns):
     return None
 
 
-def validate_dashboards(config, target=None, dashboard_ids=None, verbose=False):
+def validate_dashboards(config, target=None, dashboard_ids=None, verbose=False, workspace=None):
     """Validate dashboards for common problems: broken references, missing indices, bad queries.
 
     Args:
@@ -1599,14 +1711,14 @@ def validate_dashboards(config, target=None, dashboard_ids=None, verbose=False):
         target: Optional server name
         dashboard_ids: Optional list of dashboard IDs to validate (None = all)
         verbose: If True, include passing checks in the output
+        workspace: Optional OSD workspace id to scope the lookup to
 
     Returns:
         dict with 'dashboards' (per-dashboard results) and 'global' (cross-cutting issues)
     """
-    from .cli import get_server, get_auth, get_verify_ssl, get_base_url, get_cluster_base_url, use_dashboards_api
+    from .cli import get_server, get_auth, get_verify_ssl, get_dashboards_base_url, get_cluster_base_url, use_dashboards_api
 
     server, _ = get_server(config, target)
-    base_url = get_base_url(server)
     cluster_url = get_cluster_base_url(server)
     auth = get_auth(server)
     verify_ssl = get_verify_ssl(server)
@@ -1619,11 +1731,12 @@ def validate_dashboards(config, target=None, dashboard_ids=None, verbose=False):
     index_patterns = {}  # id -> {title, timeFieldName, fields}
 
     if use_dashboards_api(server):
-        # Fetch saved objects via Dashboards API
+        # Fetch saved objects via Dashboards API (workspace-scoped when set)
+        api_base = get_dashboards_base_url(server, workspace)
         for obj_type_q in ["dashboard", "visualization", "search", "index-pattern"]:
             page = 1
             while True:
-                url = f"{base_url}/api/saved_objects/_find?type={obj_type_q}&per_page=1000&page={page}"
+                url = f"{api_base}/api/saved_objects/_find?type={obj_type_q}&per_page=1000&page={page}"
                 resp = requests.get(url, auth=auth, verify=verify_ssl)
                 if resp.status_code != 200:
                     issues_global.append({"level": "error", "message": f"Failed to fetch {obj_type_q} objects: HTTP {resp.status_code}"})
@@ -2017,59 +2130,90 @@ def _validate_search_source(obj, issues_list, label_prefix):
                                 })
 
 
-def import_saved_objects(config, ndjson_content, target=None, obj_type=None):
-    """Import saved objects from ndjson directly to .kibana index.
+def import_saved_objects(config, ndjson_content, target=None, obj_type=None, workspace=None):
+    """Import saved objects from ndjson.
+
+    When the target has a 'dashboards' endpoint, this uses the OpenSearch
+    Dashboards `_import` saved-objects API — optionally scoped to a workspace
+    via `/w/<id>/`. That is the only path that tags objects with a workspace so
+    they show up inside it; writing straight to the `.kibana` index (the
+    fallback below, used only for cluster-only targets) leaves them
+    unassociated and therefore invisible in workspace-enabled OSD.
 
     Args:
         config: Configuration dictionary
         ndjson_content: NDJSON formatted string with saved objects
-        target: Optional server name
+        target: Optional target name
         obj_type: Optional filter - only import objects of this type
+        workspace: Optional OSD workspace id to import into
     """
-    from .cli import get_server, get_auth, get_verify_ssl, get_base_url
+    from .cli import (get_server, get_auth, get_verify_ssl, get_cluster_base_url,
+                      get_dashboards_base_url, get_workspace, use_dashboards_api)
 
     server, _ = get_server(config, target)
-    base_url = get_base_url(server)
     auth = get_auth(server)
     verify_ssl = get_verify_ssl(server)
 
     lines = ndjson_content.strip().split('\n')
 
-    imported = []
+    # Clean the payload: drop metadata lines and (optionally) type-mismatched objects.
+    kept = []
     skipped = []
-
     for line in lines:
         if not line.strip():
             continue
-
         obj = json.loads(line)
-
-        # Skip metadata lines
         if '_index_pattern_map' in obj:
             continue
-
-        # Filter by type if specified
         if obj_type and obj.get('type') != obj_type:
-            skipped.append({'id': obj.get('id', 'unknown'), 'reason': f"Type mismatch (expected {obj_type}, got {obj.get('type')})"})
+            skipped.append({'id': obj.get('id', 'unknown'),
+                            'reason': f"Type mismatch (expected {obj_type}, got {obj.get('type')})"})
             continue
+        kept.append(obj)
 
-        # Build document for .kibana index
-        doc = {
-            obj['type']: obj['attributes'],
-            'type': obj['type']
+    ws = get_workspace(server, workspace)
+
+    if use_dashboards_api(server):
+        # Preferred path: OSD saved-objects _import API (workspace-scoped when set).
+        api_base = get_dashboards_base_url(server, workspace)
+        url = f"{api_base}/api/saved_objects/_import?overwrite=true"
+        payload = ('\n'.join(json.dumps(o) for o in kept) + '\n').encode('utf-8')
+        files = {'file': ('export.ndjson', payload, 'application/ndjson')}
+        resp = requests.post(url, headers={'osd-xsrf': 'true'}, files=files,
+                             auth=auth, verify=verify_ssl)
+        try:
+            body = resp.json()
+        except ValueError:
+            body = {'raw': resp.text}
+        return {
+            'method': 'dashboards_import_api',
+            'workspace': ws,
+            'status_code': resp.status_code,
+            'success': bool(body.get('success')) if isinstance(body, dict) else False,
+            'successCount': body.get('successCount') if isinstance(body, dict) else None,
+            'errors': body.get('errors') if isinstance(body, dict) else None,
+            'skipped': skipped,
         }
+
+    # Fallback: cluster-only target (no 'dashboards' endpoint) — write directly
+    # to the .kibana cluster index. NOTE: this does not associate objects with
+    # any workspace.
+    if ws:
+        print("Warning: --workspace is ignored without a 'dashboards' endpoint "
+              "configured; objects are written to .kibana unscoped.")
+    cluster_url = get_cluster_base_url(server)
+    imported = []
+    for obj in kept:
+        doc = {obj['type']: obj['attributes'], 'type': obj['type']}
         if 'references' in obj:
             doc['references'] = obj['references']
-
-        # Import by writing directly to .kibana index
         import_resp = requests.put(
-            f"{base_url}/.kibana/_doc/{obj['type']}:{obj['id']}",
+            f"{cluster_url}/.kibana/_doc/{obj['type']}:{obj['id']}",
             headers={"Content-Type": "application/json"},
             json=doc,
             auth=auth,
             verify=verify_ssl
         )
-
         imported.append({
             'id': obj['id'],
             'type': obj['type'],
@@ -2078,7 +2222,7 @@ def import_saved_objects(config, ndjson_content, target=None, obj_type=None):
             'success': import_resp.status_code in [200, 201]
         })
 
-    return {'imported': imported, 'skipped': skipped}
+    return {'method': '.kibana_direct', 'imported': imported, 'skipped': skipped}
 
 
 # ---------------------------------------------------------------------------
