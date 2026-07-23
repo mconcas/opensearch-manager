@@ -1,13 +1,14 @@
 """osm - command line access to OpenSearch and OpenSearch Dashboards."""
 
 import argparse
+import glob
 import json
 import sys
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 from . import detectors, indices, ism, objects
-from .client import ApiError, connect, load_servers
+from .client import GLOBAL_SCOPE, ApiError, connect, load_targets
 from .output import show_json
 
 try:
@@ -50,6 +51,20 @@ def write_export(ndjson, as_json, directory):
         print(ndjson)
 
 
+def expand_files(patterns):
+    """Every argument globbed, so quoted wildcards work unexpanded by the shell.
+
+    A pattern matching nothing is kept as given, so a genuinely missing file is
+    still reported as such rather than silently dropped.
+    """
+    paths = []
+    for pattern in patterns:
+        for path in sorted(glob.glob(pattern)) or [pattern]:
+            if path not in paths:
+                paths.append(path)
+    return paths
+
+
 # --------------------------------------------------------------------------
 # Saved objects
 # --------------------------------------------------------------------------
@@ -65,12 +80,32 @@ def do_object_export(client, args):
 
 
 def do_object_import(client, args):
-    content = Path(args.file).read_text()
-    objects.print_import(objects.import_objects(client, content, args.obj_type))
+    paths = expand_files(args.files)
+    failed = 0
+    for path in paths:
+        if len(paths) > 1:
+            print(f"\n{path}")
+        try:
+            content = Path(path).read_text()
+        except OSError as error:
+            print(f"Error: {error}", file=sys.stderr)
+            failed += 1
+            continue
+        failed += objects.print_import(
+            objects.import_objects(client, content, args.obj_type))
+    return 1 if failed else 0
 
 
 def do_object_delete(client, args):
     print(objects.delete_object(client, args.id, args.obj_type))
+
+
+def do_index_pattern_list(client, args):
+    emit(args, objects.list_index_patterns(client), objects.print_index_patterns)
+
+
+def do_workspace_list(client, args):
+    emit(args, objects.list_workspaces(client), objects.print_workspaces)
 
 
 def do_detector_list(client, args):
@@ -224,14 +259,24 @@ def do_pattern_refresh(client, args):
 
 
 def do_target_list(client, args):
-    for i, server in enumerate(load_servers()):
+    for i, target in enumerate(load_targets()):
         default = "  (default)" if i == 0 else ""
-        print(f"\n{server['name']}{default}")
-        print(f"  URL: {server['protocol']}://{server['host']}")
-        for key in ("username", "cluster_path", "base_path"):
-            if server.get(key):
-                print(f"  {key}: {server[key]}")
-        print(f"  verify_ssl: {server.get('verify_ssl', True)}")
+        print(f"\n{target['name']}{default}")
+        print(f"  cluster: {endpoint_url(target.get('cluster'))}")
+        print(f"  dashboards: {endpoint_url(target.get('dashboards'))}")
+        workspace = (target.get("dashboards") or {}).get("workspace")
+        if workspace:
+            print(f"  workspace: {workspace}")
+        if target.get("username"):
+            print(f"  username: {target['username']}")
+        print(f"  verify_ssl: {target.get('verify_ssl', True)}")
+
+
+def endpoint_url(endpoint):
+    if not isinstance(endpoint, dict):
+        return "(not configured)"
+    return (f"{endpoint.get('protocol', '?')}://{endpoint.get('host', '?')}"
+            f"{endpoint.get('path', '')}")
 
 
 # --------------------------------------------------------------------------
@@ -270,7 +315,8 @@ def add_object_commands(subparsers, name, obj_type, noun, deletable=True):
                             help="export only this type")
 
     imports = group.add_parser("import", help=f"import {plural} from ndjson")
-    imports.add_argument("file")
+    imports.add_argument("files", nargs="+", metavar="FILE",
+                         help="ndjson files; wildcards are expanded")
     imports.set_defaults(run=do_object_import)
 
     if deletable:
@@ -291,13 +337,27 @@ def build_parser():
                     "path, so `osm _cluster/health` and `osm cat indices` work.",
     )
     parser.add_argument("-t", "--target", metavar="NAME",
-                        help="server from ~/.os-manager/config.json (default: the first)")
+                        help="target from ~/.os-manager/config.json (default: the first)")
+    parser.add_argument("-w", "--workspace", metavar="ID",
+                        help="scope saved objects to this Dashboards workspace, "
+                             "overriding the target's own")
+    parser.add_argument("--global", dest="workspace", action="store_const",
+                        const=GLOBAL_SCOPE,
+                        help="scope saved objects globally, ignoring the "
+                             "target's workspace")
     parser.add_argument("-v", "--version", action="version", version=f"osm {VERSION}")
     commands = parser.add_subparsers(dest="command")
 
-    commands.add_parser("target", help="show configured servers").add_subparsers(
+    commands.add_parser("target", help="show configured targets").add_subparsers(
         dest="subcommand", required=True).add_parser(
-        "list", help="list configured servers").set_defaults(run=do_target_list)
+        "list", help="list configured targets").set_defaults(run=do_target_list)
+
+    workspaces = commands.add_parser(
+        "workspace", help="Dashboards workspaces").add_subparsers(
+        dest="subcommand", required=True)
+    add_json(workspaces.add_parser(
+        "list", help="list workspaces and their ids")).set_defaults(
+        run=do_workspace_list)
 
     add_object_commands(commands, "saved-object", None, "saved object", deletable=False)
     dashboards = add_object_commands(commands, "dashboard", "dashboard", "dashboard")
@@ -473,8 +533,8 @@ def _add_index_commands(commands):
     pattern_cmds = commands.add_parser(
         "index-pattern", help="index patterns").add_subparsers(
         dest="subcommand", required=True)
-    pattern_cmds.add_parser("list", help="list index patterns").set_defaults(
-        run=do_object_list, obj_type="index-pattern")
+    add_json(pattern_cmds.add_parser("list", help="list index patterns")).set_defaults(
+        run=do_index_pattern_list, obj_type="index-pattern")
     delete_pattern = pattern_cmds.add_parser("delete", help="delete an index pattern")
     delete_pattern.add_argument("id")
     delete_pattern.set_defaults(run=do_object_delete, obj_type="index-pattern")
@@ -504,15 +564,28 @@ def raw_query(client, tokens, announce):
     return 0 if response.ok else 1
 
 
+def split_global_flags(parser, argv):
+    """Consume leading -t/-w/--global, which also apply to raw REST paths."""
+    target, workspace = None, None
+    while argv:
+        if argv[0] in ("-t", "--target"):
+            if len(argv) < 2:
+                parser.error("-t/--target requires a target name")
+            target, argv = argv[1], argv[2:]
+        elif argv[0] in ("-w", "--workspace"):
+            if len(argv) < 2:
+                parser.error("-w/--workspace requires a workspace id")
+            workspace, argv = argv[1], argv[2:]
+        elif argv[0] == "--global":
+            workspace, argv = GLOBAL_SCOPE, argv[1:]
+        else:
+            break
+    return target, workspace, argv
+
+
 def main():
     parser = build_parser()
-    argv = sys.argv[1:]
-
-    target = None
-    if argv[:1] and argv[0] in ("-t", "--target"):
-        if len(argv) < 2:
-            parser.error("-t/--target requires a server name")
-        target, argv = argv[1], argv[2:]
+    target, workspace, argv = split_global_flags(parser, sys.argv[1:])
 
     if not argv:
         parser.print_help()
@@ -524,8 +597,9 @@ def main():
             if not hasattr(args, "run"):
                 parser.print_help()
                 return 1
-            return args.run(connect(args.target or target), args) or 0
-        return raw_query(connect(target), argv, announce=target is None)
+            client = connect(args.target or target, args.workspace or workspace)
+            return args.run(client, args) or 0
+        return raw_query(connect(target, workspace), argv, announce=target is None)
     except ApiError as error:
         print(f"Error: {error}", file=sys.stderr)
         return 1

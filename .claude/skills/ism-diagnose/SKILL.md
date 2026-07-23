@@ -78,10 +78,11 @@ To also inspect the queued change_policy on an index, query the ISM config index
 python3 -c "
 import requests, json, urllib3; urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 cfg = json.load(open('/home/<user>/.os-manager/config.json'))
-srv = cfg['servers'][0]
-base = f\"{srv['protocol']}://{srv['host']}{srv.get('cluster_path','')}\"
+tgt = cfg['targets'][0]
+ep = tgt['cluster']
+base = f\"{ep['protocol']}://{ep['host']}{ep.get('path','')}\"
 body = {'query': {'term': {'managed_index.index': '<index-name>'}}, 'size': 1}
-r = requests.get(f'{base}/.opendistro-ism-config/_search', auth=(srv['username'], srv['password']), verify=False, headers={'Content-Type':'application/json'}, json=body)
+r = requests.get(f'{base}/.opendistro-ism-config/_search', auth=(tgt['username'], tgt['password']), verify=False, headers={'Content-Type':'application/json'}, json=body)
 print(json.dumps(r.json()['hits']['hits'][0]['_source']['managed_index'], indent=2))
 "
 ```

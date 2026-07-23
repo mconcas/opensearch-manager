@@ -11,26 +11,25 @@ pip install -e .
 
 ## Configuration
 
-`~/.os-manager/config.json`. The first server is the default target; `-t NAME`
-selects another.
+`~/.os-manager/config.json`. A target names two endpoints - the OpenSearch REST
+API and OpenSearch Dashboards - and shares its credentials between them. The
+first target is the default; `-t NAME` selects another.
 
 ```json
 {
-  "servers": [
+  "targets": [
     {
       "name": "local",
-      "host": "localhost:9200",
-      "protocol": "http"
+      "cluster":    { "protocol": "http", "host": "localhost:9200" },
+      "dashboards": { "protocol": "http", "host": "localhost:5601" }
     },
     {
       "name": "prod",
-      "host": "opensearch.example.com",
-      "protocol": "https",
       "username": "admin",
       "password": "secret",
       "verify_ssl": false,
-      "cluster_path": "/os",
-      "base_path": "/dashboards"
+      "cluster":    { "protocol": "https", "host": "opensearch.example.com", "path": "/os" },
+      "dashboards": { "protocol": "https", "host": "opensearch.example.com", "path": "/dashboards", "workspace": "9gt3vk" }
     }
   ]
 }
@@ -39,17 +38,38 @@ selects another.
 | Key | Meaning |
 |---|---|
 | `name` | Target name for `-t` |
-| `host` | Hostname and port |
-| `protocol` | `http` or `https` |
-| `username`, `password` | Basic auth, optional |
+| `username`, `password` | Basic auth for both endpoints, optional |
 | `verify_ssl` | Verify TLS certificates (default `true`) |
-| `cluster_path` | Path prefix to the OpenSearch REST API, e.g. `/os` |
-| `base_path` | Path prefix to Dashboards, e.g. `/dashboards` |
+| `cluster` | Endpoint of the OpenSearch REST API |
+| `dashboards` | Endpoint of OpenSearch Dashboards |
+
+Each endpoint takes `protocol` (`http` or `https`), `host` (hostname and port),
+and an optional reverse-proxy `path` prefix. `dashboards` also takes
+`workspace`, the workspace its saved objects default to.
 
 **Access modes.** Saved objects are read and written through the Dashboards
-saved-objects API when `base_path` is set, and directly against the cluster's
-`.kibana` index when it is not. Everything else always goes to the OpenSearch
-REST API under `cluster_path`.
+saved-objects API when a `dashboards` endpoint is configured, and directly
+against the cluster's `.kibana` index when it is not. Everything else always
+goes to the `cluster` endpoint. Either endpoint may be left out; a command
+needing the missing one fails with a clear error.
+
+## Workspaces
+
+Where Dashboards has workspaces enabled, saved objects belong to one and are
+invisible from the others. Every command touching saved objects - `list`,
+`export`, `import`, `delete`, `validate` - is scoped to the workspace the target
+configures, to `-w ID`, or to the global scope under `--global`.
+
+```bash
+osm -t prod workspace list                        # discover workspace ids
+osm -t prod -w 9gt3vk dashboard import dash.ndjson
+osm -t prod --global dashboard list               # ignore the configured workspace
+```
+
+The id is also the token in the Dashboards URL, `/w/<id>/app/...`. Only the
+Dashboards API tags imported objects with a workspace: against a target without
+a `dashboards` endpoint, `import` writes to `.kibana` unscoped and the objects
+appear in no workspace at all.
 
 ## Commands
 
@@ -59,14 +79,15 @@ path, so `osm _cluster/health` and `osm cat indices` work too.
 
 | Command | |
 |---|---|
-| `target list` | Configured servers |
+| `target list` | Configured targets and their endpoints |
+| `workspace list` | Dashboards workspaces and their ids |
 | `saved-object list\|export\|import` | All saved objects; `export --type` narrows by type |
 | `dashboard list\|export\|import\|delete` | Dashboards |
 | `dashboard validate [id ...]` | Check dashboards against the cluster |
 | `visualization list\|export\|import\|delete` | Visualizations |
 | `search list\|export\|import\|delete` | Saved searches |
 | `detector list\|export` | Anomaly detection detectors |
-| `index-pattern list\|delete` | Index patterns |
+| `index-pattern list\|delete` | Index patterns, with time field, workspaces, and field-cache size |
 | `index-pattern refresh <id>` | Rebuild the cached field list from the live mapping |
 | `index delete <name>` | Delete an index |
 | `index field-caps <pattern>` | Field types across a pattern, as Dashboards resolves them |
@@ -88,7 +109,8 @@ path, so `osm _cluster/health` and `osm cat indices` work too.
 | `jobs list\|pending\|policy` | Running tasks, queued master work, ISM work in flight |
 
 Every listing command takes `--json`. Export commands write ndjson to stdout,
-`--json` a JSON array, `--to-file [DIR]` one file per object.
+`--json` a JSON array, `--to-file [DIR]` one file per object. Import commands
+take several files, and expand wildcards themselves so quoting them works.
 
 Policy edits are read-modify-write under optimistic concurrency control: a
 concurrent edit to the same policy fails with HTTP 409 instead of overwriting.
@@ -104,8 +126,8 @@ osm ism policy set-rollover logs-policy --docs none
 Back up and migrate saved objects between clusters:
 
 ```bash
-osm -t prod dashboard export > dashboards.ndjson
-osm -t staging dashboard import dashboards.ndjson
+osm -t prod dashboard export --to-file backup
+osm -t staging -w 9gt3vk dashboard import 'backup/*.ndjson'
 ```
 
 Delete backing indices 90 days after creation, then apply the edit to indices

@@ -21,22 +21,15 @@ SAVED_TYPES = ("dashboard", "visualization", "search")
 def fetch_objects(client, types):
     """Saved objects of the given types, normalised across both access modes.
 
-    Returns dicts of: type, id, title, attributes, references.
+    Returns dicts of: type, id, title, attributes, references, workspaces,
+    updated_at. Through the Dashboards API the result covers the client's
+    workspace only; `.kibana` has no such scope and always holds everything.
     """
     if client.use_osd_api:
         raw = _fetch_via_api(client, types)
     else:
         raw = _fetch_via_kibana_index(client, types)
-    return [
-        {
-            "type": otype,
-            "id": oid,
-            "title": attributes.get("title") or "N/A",
-            "attributes": attributes,
-            "references": references,
-        }
-        for otype, oid, attributes, references in raw
-    ]
+    return [dict(obj, title=obj["attributes"].get("title") or "N/A") for obj in raw]
 
 
 def _fetch_via_api(client, types):
@@ -48,7 +41,16 @@ def _fetch_via_api(client, types):
         )
         found = data.get("saved_objects", [])
         objects.extend(
-            (obj["type"], obj["id"], obj.get("attributes", {}), obj.get("references", []))
+            {
+                "type": obj["type"],
+                "id": obj["id"],
+                "attributes": obj.get("attributes", {}),
+                "references": obj.get("references", []),
+                # Workspace-enabled Dashboards reports 'workspaces'; older
+                # builds carry the same idea as 'namespaces'.
+                "workspaces": _workspaces(obj.get("workspaces") or obj.get("namespaces")),
+                "updated_at": obj.get("updated_at") or "",
+            }
             for obj in found
         )
         if not found or len(objects) >= data.get("total", 0):
@@ -64,16 +66,28 @@ def _fetch_via_kibana_index(client, types):
         otype = source.get("type")
         if otype not in types:
             continue
-        # Saved-object ids are stored prefixed with their type: "dashboard:abc".
-        oid = hit["_id"].split(":", 1)[1] if ":" in hit["_id"] else hit["_id"]
         attributes = source.get(otype)
-        objects.append((
-            otype,
-            oid,
-            attributes if isinstance(attributes, dict) else {},
-            source.get("references", []),
-        ))
+        namespace = source.get("namespace")
+        objects.append({
+            "type": otype,
+            # Saved-object ids are stored prefixed with their type: "dashboard:abc".
+            "id": hit["_id"].split(":", 1)[1] if ":" in hit["_id"] else hit["_id"],
+            "attributes": attributes if isinstance(attributes, dict) else {},
+            "references": source.get("references", []),
+            "workspaces": _workspaces([namespace] if namespace else []),
+            "updated_at": source.get("updated_at") or "",
+        })
     return objects
+
+
+def _workspaces(values):
+    """Workspace ids an object belongs to.
+
+    "default" is dropped: it is the name of the classic saved-objects namespace
+    every object carries where workspaces are not in use, so reporting it would
+    make a workspace out of their absence.
+    """
+    return [value for value in (values or []) if value != "default"]
 
 
 def list_objects(client, obj_type=None):
@@ -92,6 +106,96 @@ def print_objects(rows):
         print("No objects found")
         return
     table(rows, [("Type", "type"), ("ID", "id"), ("Title", "title")])
+
+
+def list_index_patterns(client):
+    """Rows for `osm index-pattern list`.
+
+    Beyond id and title this reports what tells two similar patterns apart: the
+    time field, the workspaces the pattern belongs to, and how stale its field
+    cache is - see `osm index-pattern refresh`.
+    """
+    rows = [
+        {
+            "id": obj["id"],
+            "title": obj["title"],
+            "time_field": obj["attributes"].get("timeFieldName"),
+            "workspaces": ", ".join(obj["workspaces"]),
+            "fields": _cached_field_count(obj["attributes"].get("fields")),
+            "updated": obj["updated_at"].replace("T", " ")[:16],
+        }
+        for obj in fetch_objects(client, ("index-pattern",))
+    ]
+    rows.sort(key=lambda row: row["title"])
+    return rows
+
+
+def _cached_field_count(fields):
+    """Fields in a pattern's cache, or None when it cannot be read.
+
+    Dashboards stores the cached field list as a JSON-encoded string.
+    """
+    if not fields:
+        return 0
+    try:
+        return len(json.loads(fields))
+    except (ValueError, TypeError):
+        return None
+
+
+def print_index_patterns(rows):
+    if not rows:
+        print("No index patterns found")
+        return
+    table(rows, [("ID", "id"), ("Title", "title"), ("Time Field", "time_field"),
+                 ("Workspaces", "workspaces"), ("Fields", "fields"),
+                 ("Updated", "updated")])
+
+
+def list_workspaces(client):
+    """Workspaces defined on the target's Dashboards instance.
+
+    The `_list` API is itself global rather than workspace-scoped, so it is the
+    way to discover the ids `-w` takes.
+    """
+    if not client.use_osd_api:
+        raise ApiError(f"Target '{client.name}' has no 'dashboards' endpoint, "
+                       f"so it has no workspaces")
+    resp = client.request("POST", "api/workspaces/_list", osd=True, scoped=False,
+                          json={})
+    if resp.status_code == 404:
+        raise ApiError(f"Dashboards at {client.osd_url} has no workspaces API; "
+                       f"the workspace feature is not enabled there")
+    if not resp.ok:
+        raise ApiError(f"Failed to list workspaces: HTTP {resp.status_code}: "
+                       f"{resp.text.strip()}")
+    try:
+        data = resp.json()
+    except ValueError:
+        raise ApiError(f"Unexpected response from the workspaces API: {resp.text.strip()}")
+    # Dashboards wraps the list in {"success": true, "result": {"workspaces": [...]}};
+    # some versions put the list straight under "result".
+    result = data.get("result", data) if isinstance(data, dict) else data
+    found = result.get("workspaces", result) if isinstance(result, dict) else result
+    if not isinstance(found, list):
+        raise ApiError(f"Unexpected response from the workspaces API: {found}")
+    rows = [
+        {
+            "id": workspace.get("id"),
+            "name": workspace.get("name"),
+            "description": workspace.get("description"),
+        }
+        for workspace in found
+    ]
+    rows.sort(key=lambda row: row["name"] or "")
+    return rows
+
+
+def print_workspaces(rows):
+    if not rows:
+        print("No workspaces found")
+        return
+    table(rows, [("ID", "id"), ("Name", "name"), ("Description", "description")])
 
 
 # --------------------------------------------------------------------------
@@ -185,7 +289,14 @@ def _import_via_api(client, objects):
 
 
 def _import_via_kibana_index(client, objects):
-    """Write straight into `.kibana` - the only route without Dashboards."""
+    """Write straight into `.kibana` - the only route without Dashboards.
+
+    Objects written this way are tagged with no workspace, so a workspace-aware
+    Dashboards shows them only in the global scope.
+    """
+    if client.workspace:
+        print(f"Warning: target '{client.name}' has no 'dashboards' endpoint; "
+              f"writing to .kibana unscoped, workspace '{client.workspace}' ignored")
     imported = []
     for obj in objects:
         document = {"type": obj["type"], obj["type"]: obj["attributes"]}
@@ -204,6 +315,7 @@ def _import_via_kibana_index(client, objects):
 
 
 def print_import(result):
+    """Print an import result. Returns how many objects failed."""
     for obj in result["imported"]:
         ok = obj["error"] is None
         icon = f"{GREEN}✓{RESET}" if ok else f"{RED}✗{RESET}"
@@ -215,6 +327,7 @@ def print_import(result):
     failed = sum(1 for obj in result["imported"] if obj["error"])
     print(f"\nImported {len(result['imported']) - failed}, failed {failed}, "
           f"skipped {len(result['skipped'])}")
+    return failed
 
 
 # --------------------------------------------------------------------------
