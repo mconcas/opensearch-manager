@@ -3,15 +3,14 @@ requires = ["setuptools>=45", "setuptools-scm[toml]>=6.2"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "starsearch-manager"
+name = "os-manager"
 version = "0.1.0"
 dependencies = [
     "requests>=2.31.0",
-    "pyyaml>=6.0",
 ]
 
 [project.scripts]
-starsearch-cli = "starsearch_manager.cli:main"
+osm = "os_manager.cli:main"
 
 [tool.setuptools]
-packages = ["starsearch_manager"]
+packages = ["os_manager"]

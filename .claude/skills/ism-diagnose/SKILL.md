@@ -1,9 +1,9 @@
 ---
-name: ilm-diagnose
-description: Diagnose why an OpenSearch ISM policy "isn't applying" on a cluster. Triggers when the user asks why ISM/ILM policy edits aren't taking effect, why indices are stuck in a phase, why deletion isn't happening, or wants a health check of a named policy. Surveys (a) per-index policy_seq_no drift, (b) failed ISM steps, (c) data streams with un-rolled-over backing indices, and (d) un-enrolled indices that have policy_id set but no managed_index doc. Read-only — no mutations.
+name: ism-diagnose
+description: Diagnose why an OpenSearch ISM policy "isn't applying" on a cluster. Triggers when the user asks why ISM policy edits aren't taking effect, why indices are stuck in a state, why deletion isn't happening, or wants a health check of a named policy. Surveys (a) per-index policy_seq_no drift, (b) failed ISM steps, (c) data streams with un-rolled-over backing indices, and (d) un-enrolled indices that have policy_id set but no managed_index doc. Read-only — no mutations.
 ---
 
-# ilm-diagnose
+# ism-diagnose
 
 Walk the cluster end-to-end to explain why an ISM policy update isn't taking effect.
 
@@ -11,7 +11,7 @@ Walk the cluster end-to-end to explain why an ISM policy update isn't taking eff
 
 The user reports any of:
 - "I updated my ISM policy but it's not being applied."
-- "Index X is stuck in hot/cold/delete."
+- "Index X is stuck in the hot/cold/delete state."
 - "Why isn't ISM rolling over my data stream?"
 - "ISM says failed but nothing changes."
 
@@ -22,8 +22,8 @@ Run each step against the right `-t/--target` (or the default target). Do NOT mu
 ### 1. Identify the target and the policy under suspicion
 
 ```bash
-starsearch-cli target list
-starsearch-cli ilm policy show <policy-name>
+osm target list
+osm ism policy show <policy-name>
 ```
 
 Note the policy's `_seq_no` and `_primary_term` — this is the **current** version.
@@ -31,7 +31,7 @@ Note the policy's `_seq_no` and `_primary_term` — this is the **current** vers
 ### 2. Per-index policy version drift
 
 ```bash
-starsearch-cli ilm policy version
+osm ism policy version
 ```
 
 Three colours in the output:
@@ -44,18 +44,18 @@ Exit code 2 is returned if anything is drifted or not enrolled — scripts can u
 ### 3. Failed / stuck ISM steps
 
 ```bash
-starsearch-cli ilm status --failed
-starsearch-cli jobs policy
+osm ism status --failed
+osm jobs policy
 ```
 
 Read the `Errors:` block carefully. Two common causes:
-- "is the write index for data stream … and cannot be deleted" → use `ilm-rollover-write-index`.
+- "is the write index for data stream … and cannot be deleted" → use `ism-rollover-write-index`.
 - `condition_not_met` for hours/days → the policy's rollover/transition condition is unreachable (e.g. `min_primary_shard_size: 30gb` on a 1 MB index with no max-age fallback). Policy-level fix, not a mechanical one.
 
 ### 4. Data-stream-level view
 
 ```bash
-starsearch-cli data-stream list
+osm data-stream list
 ```
 
 Look for `generation=1` on data streams that should have rolled over by now. If the cluster has many such streams *and* the policy's rollover condition is reachable (e.g. by size), then the policy isn't being applied — confirm with step 2.
@@ -69,7 +69,7 @@ For each affected index, fetch the raw ISM explain to look at:
 - `info.cause` (most useful failure reason)
 
 ```bash
-starsearch-cli '_plugins/_ism/explain/<index-name>'
+osm '_plugins/_ism/explain/<index-name>'
 ```
 
 To also inspect the queued change_policy on an index, query the ISM config index directly:
@@ -77,7 +77,7 @@ To also inspect the queued change_policy on an index, query the ISM config index
 ```bash
 python3 -c "
 import requests, json, urllib3; urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-cfg = json.load(open('/home/<user>/.starsearch/config.json'))
+cfg = json.load(open('/home/<user>/.os-manager/config.json'))
 srv = cfg['servers'][0]
 base = f\"{srv['protocol']}://{srv['host']}{srv.get('cluster_path','')}\"
 body = {'query': {'term': {'managed_index.index': '<index-name>'}}, 'size': 1}

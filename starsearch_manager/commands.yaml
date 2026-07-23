@@ -1,7 +1,0 @@
-# Maps: command -> API prefix
-# Subcommands auto-append to prefix
-
-cluster: _cluster
-cat: _cat
-nodes: _nodes
-ilm: _ilm
