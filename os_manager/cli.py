@@ -327,7 +327,7 @@ def add_object_commands(subparsers, name, obj_type, noun, deletable=True):
 
     if deletable:
         delete = group.add_parser("delete", help=f"delete a {noun}")
-        delete.add_argument("id")
+        delete.add_argument("id", help=f"id of the {noun} to delete")
         delete.set_defaults(run=do_object_delete)
 
     for parser in group.choices.values():
@@ -408,7 +408,7 @@ def build_parser():
             run=do_index_template_list if kind == "index" else do_component_template_list)
         set_policy = template_cmds.add_parser(
             "set-policy", help="bake an ISM policy_id into the template")
-        set_policy.add_argument("name")
+        set_policy.add_argument("name", help=f"{kind} template to edit")
         set_policy.add_argument("policy_id", metavar="policy-id",
                                 help="policy to apply, or 'none' to remove")
         set_policy.set_defaults(run=do_set_template_policy, kind=kind)
@@ -451,7 +451,8 @@ def _add_ism_commands(commands):
     change = ism_cmds.add_parser(
         "change-policy", help="enrol indices on the current version of a policy")
     change.add_argument("pattern", help="index name or wildcard")
-    change.add_argument("policy_id", metavar="policy-id")
+    change.add_argument("policy_id", metavar="policy-id",
+                        help="policy to enrol the indices on")
     change.add_argument("--state", help="state to start in")
     change.set_defaults(run=do_change_policy)
 
@@ -462,22 +463,22 @@ def _add_ism_commands(commands):
 
     rollover = ism_cmds.add_parser(
         "rollover", help="roll over a data stream or write alias")
-    rollover.add_argument("name")
+    rollover.add_argument("name", help="data stream or write alias to roll over")
     rollover.set_defaults(run=do_rollover)
 
     policy = ism_cmds.add_parser("policy", help="inspect and edit policies")
     policy_cmds = policy.add_subparsers(dest="policy_command", required=True)
 
     show = policy_cmds.add_parser("show", help="print the full policy")
-    show.add_argument("name")
+    show.add_argument("name", help="policy to print")
     show.set_defaults(run=do_policy_show)
 
     create = policy_cmds.add_parser(
         "create", help="create a policy that manages indices without acting",
         epilog="The policy has one state with no actions and no transitions, "
                "so enrolled indices are managed but never modified or deleted.")
-    create.add_argument("name")
-    create.add_argument("--description")
+    create.add_argument("name", help="name of the policy to create")
+    create.add_argument("--description", help="human-readable policy description")
     create.add_argument("--state", default="keep",
                         help="name of the single state (default: keep)")
     create.add_argument("--pattern", action="append", default=[], metavar="PATTERN",
@@ -496,12 +497,16 @@ def _add_ism_commands(commands):
     rollover_edit = policy_cmds.add_parser(
         "set-rollover", help="edit a state's rollover conditions",
         epilog="Conditions merge into the existing ones; pass none to drop one.")
-    rollover_edit.add_argument("name")
-    rollover_edit.add_argument("--age", dest="min_index_age", metavar="AGE")
-    rollover_edit.add_argument("--size", dest="min_size", metavar="SIZE")
-    rollover_edit.add_argument("--docs", dest="min_doc_count", type=doc_count, metavar="N")
+    rollover_edit.add_argument("name", help="policy to edit")
+    rollover_edit.add_argument("--age", dest="min_index_age", metavar="AGE",
+                               help="roll over at this index age, e.g. 1d, or none")
+    rollover_edit.add_argument("--size", dest="min_size", metavar="SIZE",
+                               help="roll over at this total size, e.g. 50gb, or none")
+    rollover_edit.add_argument("--docs", dest="min_doc_count", type=doc_count, metavar="N",
+                               help="roll over at this document count, or none")
     rollover_edit.add_argument("--primary-shard-size", dest="min_primary_shard_size",
-                               metavar="SIZE")
+                               metavar="SIZE",
+                               help="roll over at this primary shard size, or none")
     rollover_edit.add_argument("--state", default="hot", help="state to edit (default: hot)")
     rollover_edit.set_defaults(run=do_set_rollover)
 
@@ -509,27 +514,37 @@ def _add_ism_commands(commands):
         "set-transition", help="upsert a transition between two states",
         epilog="At least one condition is required; pass none to drop one. "
                "Dropping every condition removes the transition.")
-    transition.add_argument("name")
-    transition.add_argument("from_state", metavar="from-state")
-    transition.add_argument("to_state", metavar="to-state")
-    transition.add_argument("--min-size", metavar="SIZE")
-    transition.add_argument("--min-rollover-age", metavar="AGE")
-    transition.add_argument("--min-index-age", metavar="AGE")
-    transition.add_argument("--min-doc-count", type=doc_count, metavar="N")
+    transition.add_argument("name", help="policy to edit")
+    transition.add_argument("from_state", metavar="from-state",
+                            help="state the transition leaves")
+    transition.add_argument("to_state", metavar="to-state",
+                            help="state the transition enters")
+    transition.add_argument("--min-size", metavar="SIZE",
+                            help="transition at this total size, e.g. 50gb, or none")
+    transition.add_argument("--min-rollover-age", metavar="AGE",
+                            help="transition this long after rollover, e.g. 7d, or none")
+    transition.add_argument("--min-index-age", metavar="AGE",
+                            help="transition at this index age, e.g. 90d, or none")
+    transition.add_argument("--min-doc-count", type=doc_count, metavar="N",
+                            help="transition at this document count, or none")
     transition.add_argument("--position", choices=("first", "last"), default="first",
                             help="where to insert a new transition (default: first)")
     transition.set_defaults(run=do_set_transition)
 
     template = policy_cmds.add_parser(
         "edit-ism-template", help="edit which indices the policy claims")
-    template.add_argument("name")
+    template.add_argument("name", help="policy to edit")
     template.add_argument("--replace-pattern", nargs=2, action="append",
-                          metavar=("OLD", "NEW"))
-    template.add_argument("--add-pattern", action="append", metavar="PATTERN")
-    template.add_argument("--remove-pattern", action="append", metavar="PATTERN")
+                          metavar=("OLD", "NEW"),
+                          help="swap one claimed pattern for another; repeatable")
+    template.add_argument("--add-pattern", action="append", metavar="PATTERN",
+                          help="pattern to start claiming; repeatable")
+    template.add_argument("--remove-pattern", action="append", metavar="PATTERN",
+                          help="pattern to stop claiming; repeatable")
     template.add_argument("--entry-index", type=int, default=0,
                           help="which ism_template entry to add to (default: 0)")
-    template.add_argument("--priority", type=int)
+    template.add_argument("--priority", type=int,
+                          help="ism_template priority; higher wins over other policies")
     template.set_defaults(run=do_edit_ism_template)
 
 
@@ -537,12 +552,12 @@ def _add_index_commands(commands):
     index_cmds = commands.add_parser("index", help="indices").add_subparsers(
         dest="subcommand", required=True)
     delete = index_cmds.add_parser("delete", help="delete an index")
-    delete.add_argument("name")
+    delete.add_argument("name", help="index to delete")
     delete.set_defaults(run=do_index_delete)
 
     caps = index_cmds.add_parser(
         "field-caps", help="field types across a pattern, as Dashboards sees them")
-    caps.add_argument("pattern")
+    caps.add_argument("pattern", help="index name or wildcard")
     caps.add_argument("--non-keyword", action="store_true", help="hide string fields")
     caps.add_argument("--conflicts", action="store_true",
                       help="only fields mapped as more than one type")
@@ -556,11 +571,11 @@ def _add_index_commands(commands):
     add_json(pattern_cmds.add_parser("list", help="list index patterns")).set_defaults(
         run=do_index_pattern_list, obj_type="index-pattern")
     delete_pattern = pattern_cmds.add_parser("delete", help="delete an index pattern")
-    delete_pattern.add_argument("id")
+    delete_pattern.add_argument("id", help="id of the index pattern to delete")
     delete_pattern.set_defaults(run=do_object_delete, obj_type="index-pattern")
     refresh = pattern_cmds.add_parser(
         "refresh", help="rebuild the cached field list from the live mapping")
-    refresh.add_argument("id")
+    refresh.add_argument("id", help="id of the index pattern to refresh")
     refresh.add_argument("--dry-run", action="store_true",
                          help="report the diff without writing")
     add_json(refresh).set_defaults(run=do_pattern_refresh)

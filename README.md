@@ -9,11 +9,11 @@ index state management, and raw REST access.
 pip install -e .
 ```
 
-## Configuration
+## Configure
 
-`~/.os-manager/config.json`. A target names two endpoints - the OpenSearch REST
-API and OpenSearch Dashboards - and shares its credentials between them. The
-first target is the default; `-t NAME` selects another.
+`~/.os-manager/config.json` lists targets. Each names an OpenSearch REST
+endpoint and an OpenSearch Dashboards endpoint, and shares credentials between
+them. The first target is the default; `-t NAME` selects another.
 
 ```json
 {
@@ -22,149 +22,49 @@ first target is the default; `-t NAME` selects another.
       "name": "local",
       "cluster":    { "protocol": "http", "host": "localhost:9200" },
       "dashboards": { "protocol": "http", "host": "localhost:5601" }
-    },
-    {
-      "name": "prod",
-      "username": "admin",
-      "password": "secret",
-      "verify_ssl": false,
-      "cluster":    { "protocol": "https", "host": "opensearch.example.com", "path": "/os" },
-      "dashboards": { "protocol": "https", "host": "opensearch.example.com", "path": "/dashboards", "workspace": "9gt3vk" }
     }
   ]
 }
 ```
 
-| Key | Meaning |
-|---|---|
-| `name` | Target name for `-t` |
-| `username`, `password` | Basic auth for both endpoints, optional |
-| `verify_ssl` | Verify TLS certificates (default `true`) |
-| `cluster` | Endpoint of the OpenSearch REST API |
-| `dashboards` | Endpoint of OpenSearch Dashboards |
-
-Each endpoint takes `protocol` (`http` or `https`), `host` (hostname and port),
-and an optional reverse-proxy `path` prefix. `dashboards` also takes
-`workspace`, the workspace its saved objects default to.
-
-**Access modes.** Saved objects are read and written through the Dashboards
-saved-objects API when a `dashboards` endpoint is configured, and directly
-against the cluster's `.kibana` index when it is not. Everything else always
-goes to the `cluster` endpoint. Either endpoint may be left out; a command
-needing the missing one fails with a clear error.
-
-## Workspaces
-
-Where Dashboards has workspaces enabled, saved objects belong to one and are
-invisible from the others. Every command touching saved objects - `list`,
-`export`, `import`, `delete`, `validate` - is scoped to the workspace the target
-configures, to `-w ID`, or to the global scope under `--global`.
-
 ```bash
-osm -t prod workspace list                        # discover workspace ids
-osm -t prod -w 9gt3vk dashboard import dash.ndjson
-osm -t prod --global dashboard list               # ignore the configured workspace
+osm target list
 ```
 
-The id is also the token in the Dashboards URL, `/w/<id>/app/...`. Only the
-Dashboards API tags imported objects with a workspace: against a target without
-a `dashboards` endpoint, `import` writes to `.kibana` unscoped and the objects
-appear in no workspace at all.
-
-## Commands
-
-`osm --help` lists these; `osm <command> [subcommand] --help` gives arguments
-and flags. Anything `osm` does not recognise is sent to the cluster as a REST
-path, so `osm _cluster/health` and `osm cat indices` work too.
-
-| Command | |
-|---|---|
-| `target list` | Configured targets and their endpoints |
-| `workspace list` | Dashboards workspaces and their ids |
-| `saved-object list\|export\|import` | All saved objects; `export --type` narrows by type |
-| `dashboard list\|export\|import\|delete` | Dashboards |
-| `dashboard validate [id ...]` | Check dashboards against the cluster |
-| `visualization list\|export\|import\|delete` | Visualizations |
-| `search list\|export\|import\|delete` | Saved searches |
-| `detector list\|export` | Anomaly detection detectors |
-| `index-pattern list\|delete` | Index patterns, with time field, workspaces, and field-cache size |
-| `index-pattern refresh <id>` | Rebuild the cached field list from the live mapping |
-| `index delete <name>` | Delete an index |
-| `index field-caps <pattern>` | Field types across a pattern, as Dashboards resolves them |
-| `ism list` | Policy and state per index |
-| `ism status [index]` | How each policy is executing |
-| `ism settings` | Effective `plugins.index_state_management.*` settings |
-| `ism schedule [index]` | Per-index tick interval baked in at enrolment |
-| `ism policy show <name>` | Full policy definition |
-| `ism policy version [index]` | Per-index policy version against the current one |
-| `ism policy set-rollover <name>` | Edit a state's rollover conditions |
-| `ism policy set-transition <name> <from> <to>` | Upsert a transition |
-| `ism policy edit-ism-template <name>` | Edit which indices the policy claims |
-| `ism change-policy <pattern> <policy>` | Enrol indices on the current policy version |
-| `ism retry <pattern>` | Retry a failed ISM step |
-| `ism rollover <name>` | Roll over a data stream or write alias |
-| `index-template list\|set-policy` | Index templates and their ISM policy |
-| `component-template list\|set-policy` | Component templates and their ISM policy |
-| `data-stream list [pattern]` | Data streams with write index and template |
-| `jobs list\|pending\|policy` | Running tasks, queued master work, ISM work in flight |
-
-Every listing command takes `--json`. Export commands write ndjson to stdout,
-`--json` a JSON array, `--to-file [DIR]` one file per object. Import commands
-take several files, and expand wildcards themselves so quoting them works.
-
-Policy edits are read-modify-write under optimistic concurrency control: a
-concurrent edit to the same policy fails with HTTP 409 instead of overwriting.
-Conditions merge into what is already there, and the value `none` removes one:
+## Use
 
 ```bash
-osm ism policy set-rollover logs-policy --age 1d --primary-shard-size 50gb
-osm ism policy set-rollover logs-policy --docs none
-```
-
-## Examples
-
-Back up and migrate saved objects between clusters:
-
-```bash
+osm _cluster/health                          # unrecognised commands go to the REST API
+osm cat indices
+osm dashboard list                           # saved objects
+osm dashboard validate                       # check dashboards against the cluster
+osm ism status --failed                      # policies that are stuck
 osm -t prod dashboard export --to-file backup
-osm -t staging -w 9gt3vk dashboard import 'backup/*.ndjson'
 ```
 
-Delete backing indices 90 days after creation, then apply the edit to indices
-already running the old policy version:
+`osm --help` lists the commands, and `osm <command> [subcommand] --help` gives
+the arguments of each.
+
+## Documentation
+
+Full documentation is in the [wiki](https://github.com/mconcas/opensearch-manager/wiki):
+
+- [Configuration](https://github.com/mconcas/opensearch-manager/wiki/Configuration) - targets, endpoints, access modes
+- [Command reference](https://github.com/mconcas/opensearch-manager/wiki/Command-Reference) - every command, argument and flag
+- [Workspaces](https://github.com/mconcas/opensearch-manager/wiki/Workspaces) - scoping saved objects
+- [ISM policies](https://github.com/mconcas/opensearch-manager/wiki/ISM-Policies) - enrolment, versions, editing
+- [Dashboard validation](https://github.com/mconcas/opensearch-manager/wiki/Dashboard-Validation) - the checks and their meaning
+- [Recipes](https://github.com/mconcas/opensearch-manager/wiki/Recipes) - task-oriented examples
+
+The wiki is published from [`docs/wiki/`](docs/wiki) by the
+[`wiki` workflow](.github/workflows/wiki.yml); edit the files there, not the
+wiki itself. `Command-Reference` is generated from the CLI's own argument
+definitions by `tools/gen_command_reference.py`, so it cannot drift from the
+code:
 
 ```bash
-osm -t prod ism policy set-transition logs-policy hot delete --min-index-age 90d
-osm -t prod ism change-policy 'logs-*' logs-policy
-osm -t prod ism policy version 'logs-*'
+python tools/gen_command_reference.py --stdout | less
 ```
-
-Find why a policy is stuck:
-
-```bash
-osm ism status --failed
-osm ism retry '.ds-logs-app-000001'
-```
-
-Validate dashboards, which walks dashboard -> visualization -> saved search ->
-index pattern -> cluster mapping:
-
-```
-  ✗ [InfluxDB] Overview  (id: dash.influxdb.overview)
-      ✗ [missing-field] Visualization '[InfluxDB] Messages' (id: vis.influxdb.messages)
-        references field 'message.keyword' not found in 'p2-prod-metrics-app*' [agg "terms" (id: 2)]
-
-Total: 2 dashboard(s) - 1 ok, 0 warning(s), 1 error(s), 1 global issue(s)
-```
-
-| Check | Level | Raised when |
-|---|---|---|
-| `broken-reference` | error | A referenced visualization, search, or index pattern is missing |
-| `missing-index` | error | An index pattern matches no index, alias, or data stream |
-| `missing-field` | error | An aggregation, filter, or column reads a field the mapping lacks |
-| `invalid-query` | warning | `searchSourceJSON` is malformed or has mismatched parentheses |
-| `invalid-json` | error | `panelsJSON` is not valid JSON |
-| `empty-dashboard` | warning | The dashboard has no panels or references |
 
 ## Exit codes
 

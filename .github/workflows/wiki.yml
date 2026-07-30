@@ -1,0 +1,69 @@
+name: wiki
+
+# Publishes docs/wiki/ to the GitHub wiki, with the command reference
+# regenerated from the CLI's own argparse definitions first.
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'docs/wiki/**'
+      - 'tools/gen_command_reference.py'
+      - 'os_manager/**'
+      - '.github/workflows/wiki.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: wiki
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install os-manager
+        run: pip install -e .
+
+      - name: Generate the command reference
+        run: python tools/gen_command_reference.py docs/wiki
+
+      - name: Check out the wiki
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          remote="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.wiki.git"
+          if ! git clone --quiet "$remote" wiki; then
+            echo "::error::Cannot clone the wiki of ${GITHUB_REPOSITORY}."
+            echo "GitHub only creates the wiki repository once its first page has"
+            echo "been saved through the web UI, and no API can do it. Visit"
+            echo "https://github.com/${GITHUB_REPOSITORY}/wiki, create a page with"
+            echo "any content, then re-run this workflow. Its content is replaced."
+            exit 1
+          fi
+
+      - name: Sync pages
+        run: |
+          find wiki -maxdepth 1 -name '*.md' -delete
+          cp docs/wiki/*.md wiki/
+
+      - name: Commit and push
+        working-directory: wiki
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Wiki already up to date."
+            exit 0
+          fi
+          git commit -m "docs: sync wiki from ${GITHUB_SHA::7}"
+          git push
