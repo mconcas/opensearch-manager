@@ -339,6 +339,49 @@ def print_policy_change(result, subject):
     print(f"      after:  {json.dumps(result['after'])}")
 
 
+def create_policy(client, name, description=None, state="keep", patterns=(),
+                  priority=100):
+    """Create a policy with a single state that has no actions.
+
+    ISM then manages every enrolled index without ever modifying or deleting
+    one, which is what an index needs to stop counting as unmanaged. The write
+    is a plain PUT, which the ISM API treats as create-only, so an existing
+    policy is reported rather than overwritten.
+    """
+    policy = {
+        "policy_id": name,
+        "description": description or f"No-op policy: indices stay in "
+                                     f"'{state}' and are never modified.",
+        "default_state": state,
+        "states": [{"name": state, "actions": [], "transitions": []}],
+    }
+    if patterns:
+        policy["ism_template"] = [
+            {"index_patterns": list(patterns), "priority": priority}]
+
+    response = client.request("PUT", f"_plugins/_ism/policies/{name}",
+                              json={"policy": policy})
+    if response.status_code == 409:
+        raise ApiError(f"Policy '{name}' already exists. Edit it with "
+                       f"'ism policy set-transition' or 'ism policy "
+                       f"edit-ism-template'.")
+    if not response.ok:
+        raise ApiError(f"PUT _plugins/_ism/policies/{name} -> HTTP "
+                       f"{response.status_code}: {response.text.strip()}")
+    return response.json()
+
+
+def print_policy_created(result):
+    policy = result.get("policy", {}).get("policy", {})
+    patterns = [pattern for entry in policy.get("ism_template") or []
+                for pattern in entry.get("index_patterns") or []]
+    print(f"  {GREEN}✓{RESET} created {result.get('_id')}  "
+          f"_seq_no {result.get('_seq_no')}")
+    print(f"      states:   {', '.join(s['name'] for s in policy.get('states', []))}"
+          f"  (no actions, no transitions)")
+    print(f"      claims:   {', '.join(patterns) if patterns else '(no ism_template)'}")
+
+
 def _apply_conditions(conditions, updates):
     """Merge `updates` into `conditions`; the value "none" drops a key."""
     for key, value in updates.items():

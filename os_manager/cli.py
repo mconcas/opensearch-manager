@@ -152,6 +152,12 @@ def do_policy_show(client, args):
     show_json(ism.get_policy(client, args.name))
 
 
+def do_policy_create(client, args):
+    ism.print_policy_created(ism.create_policy(
+        client, args.name, args.description, args.state, args.pattern,
+        args.priority))
+
+
 def do_policy_version(client, args):
     rows = ism.policy_version(client, args.index, args.include_orphans)
     emit(args, rows, ism.print_policy_version)
@@ -465,6 +471,20 @@ def _add_ism_commands(commands):
     show = policy_cmds.add_parser("show", help="print the full policy")
     show.add_argument("name")
     show.set_defaults(run=do_policy_show)
+
+    create = policy_cmds.add_parser(
+        "create", help="create a policy that manages indices without acting",
+        epilog="The policy has one state with no actions and no transitions, "
+               "so enrolled indices are managed but never modified or deleted.")
+    create.add_argument("name")
+    create.add_argument("--description")
+    create.add_argument("--state", default="keep",
+                        help="name of the single state (default: keep)")
+    create.add_argument("--pattern", action="append", default=[], metavar="PATTERN",
+                        help="index pattern the policy claims; repeatable")
+    create.add_argument("--priority", type=int, default=100,
+                        help="ism_template priority (default: 100)")
+    create.set_defaults(run=do_policy_create)
 
     drift = policy_cmds.add_parser(
         "version", help="per-index policy version against the current one")
